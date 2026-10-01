@@ -63,7 +63,9 @@ const CODEX_EVENTS: &[(&str, u64, bool)] = &[
 
 /// Gemini CLI events: (name, timeout in milliseconds). The relay translates the
 /// names to the ones the island knows. AfterModel is left out on purpose: it fires
-/// for every streamed chunk and would flood the island.
+/// for every streamed chunk and would flood the island. Notification is the one
+/// that says Gemini is parked on a permission prompt (observation only: nothing
+/// a hook says can answer it).
 /// See https://geminicli.com/docs/hooks/reference/
 const GEMINI_EVENTS: &[(&str, u64)] = &[
     ("SessionStart", 10_000),
@@ -72,6 +74,7 @@ const GEMINI_EVENTS: &[(&str, u64)] = &[
     ("BeforeTool", 5_000),
     ("AfterTool", 5_000),
     ("AfterAgent", 5_000),
+    ("Notification", 5_000),
 ];
 
 /// Marker that identifies a Coucou entry inside a hook file.
@@ -695,7 +698,7 @@ mod tests {
         // No permission hook exists there, and the streaming one is deliberately absent.
         assert!(after["hooks"].get("PermissionRequest").is_none());
         assert!(after["hooks"].get("AfterModel").is_none());
-        for event in ["SessionStart", "SessionEnd", "BeforeAgent", "AfterTool", "AfterAgent"] {
+        for event in ["SessionStart", "SessionEnd", "BeforeAgent", "AfterTool", "AfterAgent", "Notification"] {
             assert!(after["hooks"][event].as_array().unwrap().iter().any(entry_is_ours), "{event}");
         }
         assert_eq!(without_ours(&after), existing);

@@ -64,6 +64,8 @@ interface HookPayload {
   message?: string;
   /** Codex's Stop carries the last answer here instead of `message`. */
   last_assistant_message?: string | null;
+  /** Gemini's Notification: "ToolPermission" means it is parked on a prompt. */
+  notification_type?: string;
   /** Gemini's AfterAgent (our Stop) carries the answer here. */
   prompt_response?: string | null;
   /** UserPromptSubmit carries `prompt`; `message` belongs to Notification/Stop. */
@@ -243,6 +245,18 @@ function handleHook(island: Island, payload: HookPayload) {
   const projectName = aliasProjectName(raw || "Session");
   const focused = State.focusId === id;
 
+  // Whatever the agent was waiting on is over once it does anything else: drop the
+  // "waiting" mark. A request queued on its pill keeps it until it is answered.
+  if (
+    owner?.pillBadge === "approval" &&
+    name !== "Notification" &&
+    name !== "PermissionRequest" &&
+    !State.queuedApprovals.some((q) => q.taskId === id)
+  ) {
+    State.setPillBadge(id, null);
+    if (State.view === "question" && State.focusId === id) island.setView(State.defaultView());
+  }
+
   /** Alerts force the island open; work events only reveal the compact island. */
   const surface = (view: Parameters<Island["alert"]>[0], isAlert: boolean) => {
     if (State.mode === "expanded") {
@@ -292,7 +306,15 @@ function handleHook(island: Island, payload: HookPayload) {
     case "Notification": {
       const message = payload.message ?? "";
       const lower = message.toLowerCase();
-      if (lower.includes("rate limit") || lower.includes("limite d")) {
+      if (payload.notification_type === "ToolPermission") {
+        // Gemini is parked on a prompt only its terminal can answer: say so, and a
+        // click on its pill brings that terminal up. It cannot be approved from here.
+        State.updateTask(id, "question");
+        State.appendStep(id, (message || "Waiting for your approval").slice(0, 60));
+        Sound.play("approval");
+        if (focused) surface("question", true);
+        else State.setPillBadge(id, "approval");
+      } else if (lower.includes("rate limit") || lower.includes("limite d")) {
         State.updateTask(id, "ratelimit");
         Sound.play("rate");
       } else if (message.endsWith("?")) {

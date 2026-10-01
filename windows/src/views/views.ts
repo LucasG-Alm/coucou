@@ -361,7 +361,7 @@ function buildApproval(actions: ViewActions): ViewHost {
 
 // ── Question ──────────────────────────────────────────────────────────────────
 
-function buildQuestion(): ViewHost {
+function buildQuestion(actions: ViewActions): ViewHost {
   const who = h("div");
   const title = h("div", { class: "title" });
   const row = h("div", { class: "actions" });
@@ -370,11 +370,14 @@ function buildQuestion(): ViewHost {
     el,
     sync() {
       clear(who);
-      who.append(agentWho(State.focusTask, "Claude Code is asking a question"));
       const task = State.focusTask;
-      title.textContent = task?.steps.at(-1) ?? "Claude needs an answer.";
+      who.append(agentWho(task, `${task ? AGENT_LABEL[task.source] : "Your agent"} is asking a question`));
+      title.textContent = task?.steps.at(-1) ?? "Your agent needs an answer.";
       clear(row);
-      row.append(h("div", { class: "sub", text: "Answer in your terminal — Coucou can't reply for you yet." }));
+      row.append(
+        h("div", { class: "sub", text: "Answer in your terminal — Coucou can't reply for you yet." }),
+        btn("Open terminal", "primary", () => actions.openTerminal()),
+      );
     },
   };
 }
@@ -533,7 +536,7 @@ export function buildViews(
   map.set("overview", buildOverview(actions));
   map.set("empty", buildEmpty(actions));
   map.set("approval", buildApproval(actions));
-  map.set("question", buildQuestion());
+  map.set("question", buildQuestion(actions));
   map.set("error", buildError(actions));
   map.set("finished", buildFinished(actions));
   map.set("confused", buildConfused());
