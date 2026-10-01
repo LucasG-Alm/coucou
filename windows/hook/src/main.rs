@@ -204,11 +204,26 @@ fn read_event() -> Option<(String, String, String)> {
         ("term_session_id", "TERM_SESSION_ID"),
         ("vscode_pid", "VSCODE_PID"),
         ("session_pid", "CLAUDE_CODE_SSE_PORT"),
+        // The project root Claude Code was started in. `cwd` follows every `cd`
+        // inside the session; this does not, so it can name the session's pill.
+        ("project_dir", "CLAUDE_PROJECT_DIR"),
     ] {
         if !map.contains_key(key) {
             let value = std::env::var(var).unwrap_or_default();
             map.insert(key.into(), serde_json::Value::String(value));
         }
+    }
+
+    // The window that terminal lives in, so the island can bring it to the front
+    // and tell sessions apart. Looked up on every event, not just the first of a
+    // session: the relay is a fresh process each time and cannot know which event
+    // is the first, and a session that only ever fires tool events (Codex) would
+    // otherwise never get one. Measured at well under the cost of starting the
+    // process itself. If there is no window to be found the fields are simply absent.
+    if let Some(t) = win::find_terminal() {
+        map.insert("terminal_hwnd".into(), serde_json::json!(t.hwnd as i64));
+        map.insert("terminal_pid".into(), serde_json::json!(t.pid));
+        map.insert("terminal_exe".into(), serde_json::json!(t.exe));
     }
 
     truncate_strings(&mut payload);
