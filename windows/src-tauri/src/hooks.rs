@@ -15,6 +15,15 @@
 // and not a call, hence the `&`. coucou-hook is a console program, so PowerShell
 // waits for it and its stdout reaches Codex — which is what carries a decision.
 //
+// Antigravity (`agy`): ~\.gemini\config\hooks.json, a different shape — each hook
+// is a *named* entry at the top level, and Coucou's is called "coucou". agy runs the
+// command through `cmd /c`, and a hook that fails blocks its tool, so every command
+// ends in `|| echo <answer that changes nothing>`: with the relay gone (app
+// uninstalled) agy carries on instead of being locked out of its own tools. Its
+// PreToolUse hook can answer allow / deny / ask, which is what makes approving from
+// the island possible there. Timeouts are seconds.
+// See ~\.gemini\antigravity-cli\builtin\skills\agy-customizations\docs\hooks.md
+//
 // Gemini: same PowerShell form (it runs hooks as `powershell -Command <command>`).
 // It has no permission hook at all, so there is nothing to answer; the island only
 // watches. Its timeouts are milliseconds, not seconds.
@@ -77,6 +86,19 @@ const GEMINI_EVENTS: &[(&str, u64)] = &[
     ("Notification", 5_000),
 ];
 
+/// Antigravity events: (name, timeout seconds, grouped under a `matcher`).
+/// PreToolUse waits for a human, so it gets the decision timeout + 10 s.
+const AGY_EVENTS: &[(&str, u64, bool)] = &[
+    ("PreToolUse", 120, true),
+    ("PostToolUse", 10, true),
+    ("PreInvocation", 10, false),
+    ("PostInvocation", 10, false),
+    ("Stop", 10, false),
+];
+
+/// The name Coucou's hooks live under in Antigravity's hooks.json.
+const AGY_HOOK_NAME: &str = "coucou";
+
 /// Marker that identifies a Coucou entry inside a hook file.
 const MARKER: &str = "coucou-hook";
 
@@ -86,6 +108,7 @@ pub enum Agent {
     Claude,
     Codex,
     Gemini,
+    Antigravity,
 }
 
 impl Agent {
@@ -95,6 +118,7 @@ impl Agent {
             "claude" => Ok(Agent::Claude),
             "codex" => Ok(Agent::Codex),
             "gemini" => Ok(Agent::Gemini),
+            "antigravity" | "agy" => Ok(Agent::Antigravity),
             other => Err(format!("unknown agent {other:?}")),
         }
     }
@@ -104,6 +128,7 @@ impl Agent {
             Agent::Claude => "settings.json",
             Agent::Codex => "hooks.json",
             Agent::Gemini => "settings.json",
+            Agent::Antigravity => "hooks.json",
         }
     }
 
@@ -112,6 +137,7 @@ impl Agent {
             Agent::Claude => home().join(".claude").join("settings.json"),
             Agent::Codex => codex_home().join("hooks.json"),
             Agent::Gemini => home().join(".gemini").join("settings.json"),
+            Agent::Antigravity => home().join(".gemini").join("config").join("hooks.json"),
         }
     }
 
@@ -121,6 +147,8 @@ impl Agent {
             Agent::Claude => HOOK_EVENTS.iter().map(|(e, t)| (*e, *t, false)).collect(),
             Agent::Codex => CODEX_EVENTS.to_vec(),
             Agent::Gemini => GEMINI_EVENTS.iter().map(|(e, t)| (*e, *t, false)).collect(),
+            // Antigravity's file has its own shape; see merged_agy().
+            Agent::Antigravity => Vec::new(),
         }
     }
 
@@ -139,6 +167,7 @@ impl Agent {
                 "& '{}' {event} --agent gemini",
                 exe.to_string_lossy().replace('\'', "''")
             ),
+            Agent::Antigravity => agy_command(event),
         }
     }
 
@@ -150,6 +179,15 @@ impl Agent {
             Agent::Claude => return Ok(()),
             Agent::Codex => "Codex",
             Agent::Gemini => "Gemini CLI",
+            // ~/.gemini/config exists for Antigravity's IDE too; its CLI's own folder is the tell.
+            Agent::Antigravity => {
+                let dir = home().join(".gemini").join("antigravity-cli");
+                return if dir.exists() {
+                    Ok(())
+                } else {
+                    Err(format!("{} doesn't exist — Antigravity (agy) doesn't look installed here.", dir.display()))
+                };
+            }
         };
         match path.parent() {
             Some(dir) if !dir.exists() => Err(format!(
@@ -253,8 +291,48 @@ fn entry_is_ours(entry: &Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Antigravity's hook command, run by `cmd /c`.
+fn agy_command(event: &str) -> String {
+    let exe = settings::hook_exe_path().to_string_lossy().to_string();
+    // No quotes unless the path needs them: cmd is touchy about a quoted program name.
+    let exe = if exe.contains(char::is_whitespace) { format!("\"{exe}\"") } else { exe };
+    // What changes nothing if the relay itself cannot run (see the header comment).
+    let fallback = if event == "PreToolUse" { r#"{"decision":"ask"}"# } else { "{}" };
+    format!("{exe} {event} --agent antigravity || echo {fallback}")
+}
+
+/// hooks.json with a "coucou" hook added; the user's other named hooks are untouched.
+fn merged_agy(existing: &Value) -> Value {
+    let mut root = existing.as_object().cloned().unwrap_or_default();
+    let mut spec = Map::new();
+    for (event, timeout, grouped) in AGY_EVENTS {
+        let handler = json!({ "type": "command", "command": agy_command(event), "timeout": timeout });
+        // Tool events wrap their handlers in a matcher group; the others are flat.
+        let entry = if *grouped { json!({ "matcher": "*", "hooks": [handler] }) } else { handler };
+        spec.insert(event.to_string(), json!([entry]));
+    }
+    root.insert(AGY_HOOK_NAME.into(), Value::Object(spec));
+    Value::Object(root)
+}
+
+fn agy_entry_is_ours(root: &Value) -> bool {
+    root.get(AGY_HOOK_NAME).map(|v| v.to_string().contains(MARKER)).unwrap_or(false)
+}
+
+/// hooks.json without Coucou's hook; a "coucou" entry that is not ours stays.
+fn without_ours_agy(existing: &Value) -> Value {
+    let mut root = existing.as_object().cloned().unwrap_or_default();
+    if agy_entry_is_ours(existing) {
+        root.remove(AGY_HOOK_NAME);
+    }
+    Value::Object(root)
+}
+
 /// Settings with Coucou's hooks added; everything else is left untouched.
 fn merged(existing: &Value, agent: Agent) -> Value {
+    if agent == Agent::Antigravity {
+        return merged_agy(existing);
+    }
     let mut root = existing.as_object().cloned().unwrap_or_default();
     let mut hooks = root
         .get("hooks")
@@ -314,6 +392,11 @@ fn without_ours(existing: &Value) -> Value {
     Value::Object(root)
 }
 
+/// Removing Coucou, in the shape each agent's file has.
+fn removed(existing: &Value, agent: Agent) -> Value {
+    if agent == Agent::Antigravity { without_ours_agy(existing) } else { without_ours(existing) }
+}
+
 fn pretty(v: &Value) -> String {
     serde_json::to_string_pretty(v).unwrap_or_default()
 }
@@ -355,17 +438,21 @@ fn current_fingerprint(agent: Agent) -> String {
 
 pub fn status(agent: Agent) -> HookStatus {
     let current = read_settings_lossy(agent);
-    let installed = current
-        .get("hooks")
-        .and_then(Value::as_object)
-        .map(|hooks| {
-            hooks
-                .values()
-                .filter_map(Value::as_array)
-                .flatten()
-                .any(entry_is_ours)
-        })
-        .unwrap_or(false);
+    let installed = if agent == Agent::Antigravity {
+        agy_entry_is_ours(&current)
+    } else {
+        current
+            .get("hooks")
+            .and_then(Value::as_object)
+            .map(|hooks| {
+                hooks
+                    .values()
+                    .filter_map(Value::as_array)
+                    .flatten()
+                    .any(entry_is_ours)
+            })
+            .unwrap_or(false)
+    };
     let hook_path = settings::hook_exe_path();
     HookStatus {
         installed,
@@ -378,7 +465,7 @@ pub fn status(agent: Agent) -> HookStatus {
 pub fn preview(agent: Agent, install: bool) -> Result<HookPreview, String> {
     agent.check_installed()?;
     let current = read_settings(agent)?;
-    let next = if install { merged(&current, agent) } else { without_ours(&current) };
+    let next = if install { merged(&current, agent) } else { removed(&current, agent) };
     Ok(HookPreview {
         diff: unified_diff(&pretty(&current), &pretty(&next)),
         backup: backup_path(agent).to_string_lossy().to_string(),
@@ -414,7 +501,7 @@ pub fn write(agent: Agent, install: bool, fingerprint: &str) -> Result<String, S
         std::fs::copy(&path, &backup).map_err(|e| format!("backup failed: {e}"))?;
     }
 
-    let next = if install { merged(&current, agent) } else { without_ours(&current) };
+    let next = if install { merged(&current, agent) } else { removed(&current, agent) };
     let mut text = pretty(&next);
     text.push('\n');
 
@@ -705,6 +792,38 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_gets_a_named_hook_that_can_never_lock_its_tools() {
+        // Someone else's named hook, in agy's own shape.
+        let existing = serde_json::json!({
+            "safety-gate": { "PreToolUse": [{ "matcher": "run_command", "hooks": [{ "command": "./check.sh" }] }] }
+        });
+        let after = merged(&existing, Agent::Antigravity);
+        assert_eq!(after["safety-gate"], existing["safety-gate"], "another hook was touched");
+
+        let ours = &after[AGY_HOOK_NAME];
+        // Tool events carry a matcher group, the others are flat handlers.
+        let pre = &ours["PreToolUse"][0];
+        assert_eq!(pre["matcher"], "*");
+        assert_eq!(pre["hooks"][0]["timeout"], 120, "PreToolUse waits for a human");
+        let stop = &ours["Stop"][0];
+        assert!(stop.get("matcher").is_none() && stop["type"] == "command", "got: {stop}");
+
+        // A failing hook blocks the tool in agy, so every command carries a way out.
+        let command = pre["hooks"][0]["command"].as_str().unwrap();
+        assert!(command.contains("coucou-hook"), "got: {command}");
+        assert!(command.contains(" PreToolUse --agent antigravity || echo "), "got: {command}");
+        assert!(command.ends_with(r#"{"decision":"ask"}"#), "got: {command}");
+        assert!(stop["command"].as_str().unwrap().ends_with("echo {}"));
+
+        assert!(agy_entry_is_ours(&after));
+        assert!(!agy_entry_is_ours(&existing));
+        // Removing puts the file back, and leaves a "coucou" entry that is not ours alone.
+        assert_eq!(without_ours_agy(&after), existing);
+        let foreign = serde_json::json!({ "coucou": { "Stop": [{ "command": "mine.sh" }] } });
+        assert_eq!(without_ours_agy(&foreign), foreign);
+    }
+
+    #[test]
     fn a_single_quote_in_the_path_is_doubled_for_powershell() {
         // Not the real exe path: this pins the escaping rule on its own.
         assert_eq!("C:\\Users\\O'Brien\\x.exe".replace('\'', "''"), "C:\\Users\\O''Brien\\x.exe");
@@ -716,6 +835,8 @@ mod tests {
         assert_eq!(Agent::parse(Some("claude")), Ok(Agent::Claude));
         assert_eq!(Agent::parse(Some("codex")), Ok(Agent::Codex));
         assert_eq!(Agent::parse(Some("gemini")), Ok(Agent::Gemini));
+        assert_eq!(Agent::parse(Some("antigravity")), Ok(Agent::Antigravity));
+        assert_eq!(Agent::parse(Some("agy")), Ok(Agent::Antigravity));
         assert!(Agent::parse(Some("gpt")).is_err());
     }
 

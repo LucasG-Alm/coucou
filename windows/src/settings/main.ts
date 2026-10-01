@@ -56,6 +56,12 @@ const AGENT_UI: Record<HookAgent, { title: string; file: string; after: string }
     // Codex skips hooks it has not been told to trust; that step is yours.
     after: "Codex runs a hook only after you trust it: open /hooks in Codex once and trust the Coucou hooks.",
   },
+  antigravity: {
+    title: "Antigravity (agy)",
+    file: "hooks.json",
+    // Unlike Gemini CLI, agy's hooks can answer: a shell command it would ask about waits here.
+    after: "Open a new agy session to pick the hooks up. A shell command agy would ask about shows up here first (Allow or Deny); anything you already allowed, and every other tool, is only watched. If Coucou is closed, agy asks in the terminal as usual.",
+  },
   gemini: {
     title: "Gemini CLI",
     file: "settings.json",
@@ -451,6 +457,7 @@ async function main() {
   const status = (await Bridge.hooksStatus("claude")) ?? { ...noHooks };
   const codexStatus = (await Bridge.hooksStatus("codex")) ?? { ...noHooks };
   const geminiStatus = (await Bridge.hooksStatus("gemini")) ?? { ...noHooks };
+  const agyStatus = (await Bridge.hooksStatus("antigravity")) ?? { ...noHooks };
 
   const hasKey = (await Bridge.secretPresent("anthropic-api-key")) ?? false;
 
@@ -466,6 +473,7 @@ async function main() {
     h("h1", {}, h("span", { text: "Coucou" }), h("span", { class: "version", text: version })),
     agentSection("claude", status),
     agentSection("codex", codexStatus),
+    agentSection("antigravity", agyStatus),
     agentSection("gemini", geminiStatus),
     apiSection(hasKey),
     integrationsSection(present),

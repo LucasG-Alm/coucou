@@ -74,7 +74,14 @@ fn connect() -> Option<std::fs::File> {
 }
 
 fn main() {
-    let Some((payload, event, agent)) = read_event() else { std::process::exit(0) };
+    let Some((payload, event, agent)) = read_event() else {
+        // agy reads every hook's stdout as JSON and a hook that fails blocks its tool,
+        // so even a payload we cannot parse gets the answer that changes nothing.
+        if parse_args(std::env::args().skip(1)).1 == "antigravity" {
+            println!("{AGY_ASK}");
+        }
+        std::process::exit(0)
+    };
 
     let waits_for_answer = event == "PermissionRequest";
     let budget = if waits_for_answer { DECISION_BUDGET } else { FIRE_AND_FORGET_BUDGET };
@@ -89,7 +96,7 @@ fn main() {
     });
 
     let decided = match rx.recv_timeout(budget) {
-        Ok(Some(decision)) => decision_json(&decision),
+        Ok(Some(decision)) => reply_for(&agent, &decision),
         _ => None,
     };
     if let Some(json) = decided.or_else(|| silent_reply(&agent, &event)) {
@@ -105,8 +112,42 @@ fn main() {
 /// `Stop` hook that exits 0 without JSON ("plain text output is invalid for this
 /// event"), so it gets an empty object. Everything else stays silent.
 /// See https://developers.openai.com/codex/hooks
+///
+/// Antigravity (`agy`) is the strictest: every hook must print JSON, and a hook
+/// that fails *blocks the tool*. A tool check we have nothing to say about gets
+/// `ask` (= "carry on as if you had no hook": its own allow-list, then its own
+/// prompt); every other event gets `{}`.
 fn silent_reply(agent: &str, event: &str) -> Option<String> {
-    (agent == "codex" && event == "Stop").then(|| "{}".to_string())
+    match (agent, event) {
+        ("codex", "Stop") => Some("{}".to_string()),
+        ("antigravity", "PreToolUse" | "PermissionRequest") => Some(AGY_ASK.to_string()),
+        ("antigravity", _) => Some("{}".to_string()),
+        _ => None,
+    }
+}
+
+/// Antigravity's "no opinion": its own permission rules and prompt decide.
+const AGY_ASK: &str = r#"{"decision":"ask"}"#;
+
+/// What goes back to the agent for a click on the island.
+fn reply_for(agent: &str, decision: &str) -> Option<String> {
+    if agent == "antigravity" {
+        agy_decision_json(decision)
+    } else {
+        decision_json(decision)
+    }
+}
+
+/// Antigravity's PreToolUse answer: `allow` runs the tool without asking, `deny`
+/// blocks it. Anything we do not recognise says nothing (the caller then falls
+/// back to `ask`), never a guess.
+/// See ~/.gemini/antigravity-cli/builtin/skills/agy-customizations/docs/hooks.md
+fn agy_decision_json(decision: &str) -> Option<String> {
+    match decision.trim() {
+        "allow" | "always" => Some(r#"{"decision":"allow"}"#.to_string()),
+        "deny" => Some(r#"{"decision":"deny","reason":"Denied from Coucou"}"#.to_string()),
+        _ => None,
+    }
 }
 
 /// `<Event> [--agent <name>]` from argv (program name already skipped).
@@ -136,17 +177,103 @@ fn parse_args(args: impl Iterator<Item = String>) -> (String, String) {
 /// Gemini has no PermissionRequest, so nothing here ever waits for a human.
 /// See https://geminicli.com/docs/hooks/reference/
 fn canonical_event(agent: &str, event: &str) -> String {
-    if agent != "gemini" {
-        return event.to_string();
-    }
-    match event {
-        "BeforeTool" => "PreToolUse",
-        "AfterTool" => "PostToolUse",
-        "BeforeAgent" => "UserPromptSubmit",
-        "AfterAgent" => "Stop",
-        other => other,
+    match (agent, event) {
+        ("gemini", "BeforeTool") => "PreToolUse",
+        ("gemini", "AfterTool") => "PostToolUse",
+        ("gemini", "BeforeAgent") => "UserPromptSubmit",
+        ("gemini", "AfterAgent") => "Stop",
+        // Antigravity: a model call starting is the nearest thing to "prompt
+        // submitted", and the end of one is just more work happening.
+        ("antigravity", "PreInvocation") => "UserPromptSubmit",
+        ("antigravity", "PostInvocation") => "PostToolUse",
+        (_, other) => other,
     }
     .to_string()
+}
+
+/// Tools whose use Antigravity asks the user about. Others (reading files, viewing
+/// a page…) are only watched. `run_command` is the one that matters.
+const AGY_GATED_TOOLS: &[&str] = &["run_command"];
+
+type JsonMap = serde_json::Map<String, serde_json::Value>;
+
+/// Antigravity speaks camelCase and nests the tool call; the island speaks Claude's
+/// flat snake_case. Translate the fields it reads, and keep everything else.
+fn agy_normalize(map: &mut JsonMap) {
+    use serde_json::Value;
+    let text = |v: Option<&Value>| v.and_then(Value::as_str).map(str::to_string);
+
+    if let Some(id) = text(map.get("conversationId")) {
+        map.insert("session_id".into(), Value::String(id));
+    }
+    // The workspace is both where the session is and what it is called.
+    if let Some(ws) = map
+        .get("workspacePaths")
+        .and_then(Value::as_array)
+        .and_then(|a| a.first())
+        .and_then(Value::as_str)
+        .map(str::to_string)
+    {
+        map.entry("cwd").or_insert_with(|| Value::String(ws.clone()));
+        map.entry("project_dir").or_insert(Value::String(ws));
+    }
+    if let Some(call) = map.get("toolCall").and_then(Value::as_object).cloned() {
+        if let Some(name) = text(call.get("name")) {
+            map.insert("tool_name".into(), Value::String(name));
+        }
+        let mut args = call.get("args").and_then(Value::as_object).cloned().unwrap_or_default();
+        // The names the island already knows how to show.
+        for (from, to) in [
+            ("CommandLine", "command"),
+            ("AbsolutePath", "file_path"),
+            ("TargetFile", "file_path"),
+            ("DirectoryPath", "path"),
+            ("SearchPath", "path"),
+            ("Query", "query"),
+            ("Url", "url"),
+        ] {
+            if let Some(v) = args.get(from).cloned() {
+                args.entry(to).or_insert(v);
+            }
+        }
+        map.insert("tool_input".into(), Value::Object(args));
+    }
+}
+
+/// `command(<exact command line>)` is how Antigravity stores a command you have
+/// told it to always allow. An exact match is the only thing we trust.
+fn is_allow_listed(rules: &[String], tool: &str, command: &str) -> bool {
+    let kind = if tool == "run_command" { "command" } else { tool };
+    let want = format!("{kind}({command})");
+    rules.iter().any(|r| *r == want)
+}
+
+/// `permissions.allow` from agy's own settings; empty if it cannot be read, which
+/// only means more cards, never fewer.
+fn agy_allow_rules() -> Vec<String> {
+    let Some(home) = std::env::var_os("USERPROFILE") else { return Vec::new() };
+    let path = std::path::Path::new(&home).join(".gemini/antigravity-cli/settings.json");
+    let Ok(bytes) = std::fs::read(path) else { return Vec::new() };
+    let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return Vec::new() };
+    v["permissions"]["allow"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|r| r.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+/// Whether this (already normalised) tool check should go to the island and wait:
+/// a gated tool that Antigravity would otherwise ask the user about.
+fn agy_needs_island(map: &JsonMap, rules: &[String]) -> bool {
+    let tool = map.get("tool_name").and_then(|v| v.as_str()).unwrap_or("");
+    if !AGY_GATED_TOOLS.contains(&tool) {
+        return false;
+    }
+    let command = map
+        .get("tool_input")
+        .and_then(|i| i.get("command"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    !is_allow_listed(rules, tool, command)
 }
 
 /// The documented PermissionRequest output. Anything we do not recognise prints
@@ -192,7 +319,14 @@ fn read_event() -> Option<(String, String, String)> {
         .map(str::to_string)
         .filter(|s| !s.is_empty())
         .unwrap_or(arg_event);
-    let event = canonical_event(&agent, &event);
+    let mut event = canonical_event(&agent, &event);
+    if agent == "antigravity" {
+        agy_normalize(map);
+        // A command it would ask about waits for the island, like a PermissionRequest.
+        if event == "PreToolUse" && agy_needs_island(map, &agy_allow_rules()) {
+            event = "PermissionRequest".to_string();
+        }
+    }
     map.insert("hook_event_name".into(), serde_json::Value::String(event.clone()));
     map.insert("agent".into(), serde_json::Value::String(agent.clone()));
 
@@ -363,6 +497,75 @@ mod tests {
         assert_eq!(canonical_event("gemini", "PreToolUse"), "PreToolUse");
         // Only Gemini is translated: another agent's "BeforeTool" is not ours to guess.
         assert_eq!(canonical_event("codex", "BeforeTool"), "BeforeTool");
+    }
+
+    fn agy_payload(tool: &str, args: serde_json::Value) -> JsonMap {
+        let mut v = serde_json::json!({
+            "conversationId": "4c26bc5a-3352",
+            "workspacePaths": ["C:/Users/lucas/proj"],
+            "stepIdx": 2,
+            "toolCall": { "name": tool, "args": args }
+        });
+        let map = v.as_object_mut().unwrap();
+        agy_normalize(map);
+        map.clone()
+    }
+
+    #[test]
+    fn an_antigravity_payload_becomes_the_flat_one_the_island_reads() {
+        let m = agy_payload("run_command", serde_json::json!({"CommandLine": "npm test", "Cwd": "C:/x"}));
+        assert_eq!(m["session_id"], "4c26bc5a-3352");
+        assert_eq!(m["cwd"], "C:/Users/lucas/proj");
+        assert_eq!(m["project_dir"], "C:/Users/lucas/proj");
+        assert_eq!(m["tool_name"], "run_command");
+        assert_eq!(m["tool_input"]["command"], "npm test");
+        // The original argument is still there for anyone who wants it.
+        assert_eq!(m["tool_input"]["CommandLine"], "npm test");
+    }
+
+    #[test]
+    fn antigravity_events_are_translated() {
+        assert_eq!(canonical_event("antigravity", "PreInvocation"), "UserPromptSubmit");
+        assert_eq!(canonical_event("antigravity", "PostInvocation"), "PostToolUse");
+        assert_eq!(canonical_event("antigravity", "PreToolUse"), "PreToolUse");
+        assert_eq!(canonical_event("antigravity", "Stop"), "Stop");
+        // Not another agent's business.
+        assert_eq!(canonical_event("codex", "PreInvocation"), "PreInvocation");
+    }
+
+    #[test]
+    fn only_commands_agy_would_ask_about_go_to_the_island() {
+        let rules = vec!["command(git status)".to_string(), "read_url(gstatic.com)".to_string()];
+        let ask = |tool: &str, cmd: &str| {
+            agy_needs_island(&agy_payload(tool, serde_json::json!({"CommandLine": cmd})), &rules)
+        };
+        // Already allowed: agy will not ask, so neither do we.
+        assert!(!ask("run_command", "git status"));
+        // New, or only *similar* to an allowed one: exact match or nothing.
+        assert!(ask("run_command", "git push --force"));
+        assert!(ask("run_command", "git status --short"));
+        assert!(ask("run_command", ""));
+        // Tools we only watch.
+        assert!(!ask("view_file", "anything"));
+    }
+
+    #[test]
+    fn agy_answers_are_the_documented_ones_and_silence_is_ask() {
+        assert_eq!(agy_decision_json("allow").unwrap(), r#"{"decision":"allow"}"#);
+        assert_eq!(agy_decision_json("always").unwrap(), r#"{"decision":"allow"}"#);
+        assert_eq!(
+            agy_decision_json("deny").unwrap(),
+            r#"{"decision":"deny","reason":"Denied from Coucou"}"#
+        );
+        assert!(agy_decision_json("maybe").is_none());
+        // The same click means a different JSON per agent.
+        assert!(reply_for("claude", "allow").unwrap().contains("hookSpecificOutput"));
+        assert_eq!(reply_for("antigravity", "allow").unwrap(), r#"{"decision":"allow"}"#);
+        // No answer must never become a block: agy gets `ask` on a tool check, `{}` elsewhere.
+        assert_eq!(silent_reply("antigravity", "PreToolUse").unwrap(), AGY_ASK);
+        assert_eq!(silent_reply("antigravity", "PermissionRequest").unwrap(), AGY_ASK);
+        assert_eq!(silent_reply("antigravity", "Stop").unwrap(), "{}");
+        assert_eq!(silent_reply("claude", "PermissionRequest"), None);
     }
 
     #[test]

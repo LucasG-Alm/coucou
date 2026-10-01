@@ -147,7 +147,7 @@ export interface Placement {
 }
 
 /** Whose hook file: Claude Code's settings.json, Codex's hooks.json or Gemini CLI's settings.json. */
-export type HookAgent = "claude" | "codex" | "gemini";
+export type HookAgent = "claude" | "codex" | "gemini" | "antigravity";
 
 export interface HookStatus {
   installed: boolean;

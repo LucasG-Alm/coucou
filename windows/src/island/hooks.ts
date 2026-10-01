@@ -135,6 +135,9 @@ const TOOL_LABELS: Record<string, string> = {
   list_directory: "Liste",
   google_web_search: "Recherche web",
   web_fetch: "Récupère",
+  // Antigravity (agy).
+  run_command: "Exécute",
+  view_file: "Lit",
 };
 
 function stepLabel(tool: string, input: Record<string, unknown>): string {
