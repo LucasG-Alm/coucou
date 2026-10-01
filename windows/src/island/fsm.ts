@@ -18,6 +18,11 @@ export class IslandStateMachine {
   greetHoverCollapseDelay = 10;
   /** An alert waiting for an answer stays open, even when the mouse leaves. */
   pinned = false;
+  /**
+   * A free-floating island has no edge to wake it from, so it must never hide on
+   * its own. (A delay of Infinity would not do: setTimeout reads it as 0.)
+   */
+  neverHide = false;
 
   private petitHide: number | null = null;
   private homeCollapse: number | null = null;
@@ -106,6 +111,7 @@ export class IslandStateMachine {
 
   private schedulePetitHide() {
     this.clear("petitHide");
+    if (this.neverHide) return;
     this.petitHide = window.setTimeout(() => {
       this.petitHide = null;
       if (this.state === "petit") this.transition("hidden");

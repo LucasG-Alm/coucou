@@ -5,7 +5,7 @@
 import { h, svg, clear, dot } from "./dom";
 import { ICONS } from "./icons";
 import { Ticker } from "./ticker";
-import { AGENT_LABEL, defaultTaskName, isAgentTask, State, type AgentTask } from "../core/state";
+import { AGENT_LABEL, isAgentTask, State, taskLabel, type AgentTask } from "../core/state";
 import { washRGBA, type IslandViewName, type Wash } from "../core/layout";
 import { createMiniBot, pruneMiniBots } from "../mochi/minibots";
 import { buildPrompt } from "./chat";
@@ -82,6 +82,13 @@ export function buildHeader(actions: ViewActions): ViewHost {
   const tabChat = h("button", { class: "tab", title: "Ask", onclick: () => go("prompt") }, svg(ICONS.bubble, 13));
   const tabDrop = h("button", { class: "tab", title: "Drop", onclick: () => go("upload") }, svg(ICONS.plus, 13));
 
+  // Minimise: back to the compact pill (Esc does the same). Not `go()`: it does not
+  // change view, it closes the panel.
+  const minBtn = h(
+    "button",
+    { title: "Minimize", onclick: () => { actions.blip(); actions.collapse(); } },
+    svg(ICONS.minus, 14, { stroke: 2.6 }),
+  );
   const gearBtn = h("button", { title: "Settings", onclick: () => go("settings") }, svg(ICONS.gear, 14));
   const soundBtn = h("button", { title: "Mute", onclick: () => actions.toggleSound() }, svg(ICONS.speakerOn, 14));
 
@@ -94,7 +101,7 @@ export function buildHeader(actions: ViewActions): ViewHost {
     "div",
     { id: "header" },
     h("div", { class: "tabs" }, tabHome, tabChat, tabDrop),
-    h("div", { class: "header-actions" }, gearBtn, soundBtn),
+    h("div", { class: "header-actions" }, minBtn, gearBtn, soundBtn),
   );
 
   return {
@@ -214,8 +221,10 @@ function buildOverview(actions: ViewActions): ViewHost {
 
       jump.style.display = detailOpen ? "none" : "";
 
-      const others = State.otherTasks.slice(0, 4);
-      const pillKey = others.map((t) => `${t.id}:${t.pillBadge ?? ""}`).join("|");
+      // Three rows of two fit the card; with a pill per terminal there can be more
+      // than the four a lone agent ever needed.
+      const others = State.otherTasks.slice(0, 6);
+      const pillKey = others.map((t) => `${t.id}:${t.pillBadge ?? ""}:${taskLabel(t, State.tasks)}`).join("|");
       if (pillKey !== pillIds) {
         pillIds = pillKey;
         clear(pills);
@@ -227,8 +236,8 @@ function buildOverview(actions: ViewActions): ViewHost {
 }
 
 function buildPill(task: AgentTask, actions: ViewActions): HTMLElement {
-  // The agent's own name, not `task.name`: during a session that holds the project folder.
-  const label = defaultTaskName(task.id);
+  // An agent's pill carries the agent's name; a session's carries its folder.
+  const label = taskLabel(task, State.tasks);
   const canvas = createMiniBot(task, 24);
   const pill = h(
     "div",
@@ -237,6 +246,8 @@ function buildPill(task: AgentTask, actions: ViewActions): HTMLElement {
     h("span", { class: "lbl", text: label }),
   );
   pill.style.borderColor = `${task.color}24`;
+  // The label is the folder; which agent it is shows in the colour and, here, in words.
+  pill.title = task.sessionId ? `${AGENT_LABEL[task.source]} · ${task.name}` : label;
   pill.addEventListener("mouseenter", () => {
     pill.style.background = `${task.color}2e`;
     pill.style.borderColor = `${task.color}8c`;

@@ -52,14 +52,13 @@ body {
   inset: 0;
 }
 
-/* Invisible strip that wakes the island when it is hidden. */
+/* Invisible strip that wakes the island when it is hidden. While hidden the whole
+   window *is* the strip — 240×6 on the top edge, 6×240 on a side edge — so it
+   simply fills it. The island turns it on only then (it stays display:none while
+   the window is the full panel, or it would catch clicks meant for other apps). */
 #wake-strip {
   position: fixed;
-  top: 0;
-  left: 50%;
-  transform: translateX(-50%);
-  width: 240px;
-  height: 6px;
+  inset: 0;
   background: transparent;
 }
 
@@ -387,6 +386,30 @@ body {
 
 .overview > .right {
   flex: 1 1 auto;
+}
+
+/* ── Open island standing on a side edge ─────────────────────────────────────
+   The narrow column (see UPRIGHT_W in layout.ts): the card keeps its 322 px and
+   the agent pills drop below it instead of sitting beside it. Every other view is
+   one card across the whole width and just reflows. */
+#island.upright .overview {
+  flex-direction: column;
+}
+
+#island.upright .overview > .left {
+  flex: 0 0 108px;
+  width: auto;
+  height: 108px;
+}
+
+#island.upright .overview > .right {
+  min-height: 0;
+}
+
+/* The settings rows were laid out for 380 px of room; let them wrap in 220. */
+#island.upright .settings-row {
+  flex-wrap: wrap;
+  row-gap: 6px;
 }
 
 .card-body {

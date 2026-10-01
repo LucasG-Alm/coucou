@@ -4,6 +4,15 @@
 
 export type IslandMode = "hidden" | "compact" | "expanded";
 
+/**
+ * Where the island lives: the notch spot, a vertical strip on the left or right
+ * edge, or a horizontal pill left wherever it was dropped (see Settings::dock).
+ */
+export type DockKind = "top" | "left" | "right" | "free";
+
+/** The compact and hidden forms stand upright on a side edge. */
+export const isVertical = (dock: DockKind): boolean => dock === "left" || dock === "right";
+
 export type IslandViewName =
   | "overview"
   | "empty"
@@ -97,19 +106,91 @@ export function chatPromptHeight(messageCount: number): number {
   return Math.min(300, 240 + messageCount * 40);
 }
 
+// ── Open island on a side edge ──────────────────────────────────────────────────
+// Docked left or right, the open island is a narrow column instead of the wide
+// panel. Most views are a single full-width card, so they reflow on their own; the
+// overview is the exception (card and agent pills side by side), and the CSS class
+// `upright` stacks them.
+
+/** 322 px for the overview's left card, plus the 10 px of padding on each side. */
+export const UPRIGHT_W = 342;
+
+/**
+ * Views drawn on a fixed 640 px canvas — the launch greeting and the drop
+ * sequence — can't reflow, so even on a side edge they open as the wide panel.
+ */
+const WIDE_ONLY: ReadonlySet<IslandViewName> = new Set(["greeting", "upload", "uploading", "choose"]);
+
+/** Whether this view opens as the narrow column when docked here. */
+export const usesUprightLayout = (dock: DockKind, view: IslandViewName): boolean =>
+  isVertical(dock) && !WIDE_ONLY.has(view);
+
+/**
+ * Island heights for the narrow layout: 8 px top padding + 34 px header + the card
+ * + 10 px bottom padding. Text wraps in 190 px instead of 380, so these are taller
+ * than the wide ones. None may exceed PANEL_H, the window's height.
+ */
+const UPRIGHT_HEIGHTS: Record<IslandViewName, number> = {
+  overview: 278, // the tallest: three rows of pills; see uprightOverviewHeight()
+  empty: 190,
+  approval: 220,
+  question: 190,
+  error: 220,
+  finished: 190,
+  confused: 160,
+  note: 160,
+  settings: 230,
+  mail: 160,
+  searching: 160,
+  result: 160,
+  prompt: 300, // replaced by uprightChatHeight()
+  // Never used here (see WIDE_ONLY); listed so the record stays complete.
+  greeting: 150,
+  upload: 176,
+  uploading: 176,
+  choose: 176,
+};
+
+function uprightChatHeight(messageCount: number): number {
+  return Math.min(PANEL_H, 280 + messageCount * 40);
+}
+
+/**
+ * The overview stacks its 108 px card over the agent pills, two to a row and at
+ * most three rows, so its height follows how many pills there are: 8 top padding +
+ * 34 header + 108 card + 10 gap + the pills' card + 10 bottom padding.
+ */
+function uprightOverviewHeight(pills: number): number {
+  const rows = Math.min(3, Math.max(1, Math.ceil(pills / 2)));
+  return 8 + 34 + 108 + 10 + (rows * 28 + (rows - 1) * 4 + 16) + 10;
+}
+
 export function islandSize(
   mode: IslandMode,
   view: IslandViewName,
   chatCount = 0,
+  dock: DockKind = "top",
+  /** How many agent pills sit beside / under the overview card. */
+  pills = 0,
 ): { w: number; h: number } {
+  const upright = isVertical(dock);
   switch (mode) {
     case "hidden":
       // No notch to hide inside on a PC: the island retracts to zero height and
       // slides into the top edge of the screen instead of sitting there as a bar.
-      return { w: NOTCH_W, h: 0 };
+      // On a side edge it retracts to zero width instead.
+      return upright ? { w: 0, h: NOTCH_W } : { w: NOTCH_W, h: 0 };
     case "compact":
-      return { w: COMPACT_W, h: NOTCH_H };
+      // The same pill stood on its end: 32 wide, 288 tall.
+      return upright ? { w: NOTCH_H, h: COMPACT_W } : { w: COMPACT_W, h: NOTCH_H };
     case "expanded": {
+      if (usesUprightLayout(dock, view)) {
+        const h =
+          view === "prompt" ? uprightChatHeight(chatCount)
+          : view === "overview" ? uprightOverviewHeight(pills)
+          : UPRIGHT_HEIGHTS[view];
+        return { w: UPRIGHT_W, h };
+      }
       const h = view === "prompt" ? chatPromptHeight(chatCount) : VIEW_LAYOUTS[view].height;
       return { w: EXPANDED_W, h };
     }
@@ -129,14 +210,29 @@ export function botPosition(
   view: IslandViewName,
   islandH: number,
   uploadProgress = 0,
+  dock: DockKind = "top",
 ): BotPlacement {
+  const upright = isVertical(dock);
   switch (mode) {
     case "hidden":
-      return { cx: 46, cy: 16, diameter: 6, opacity: 0 };
+      return upright
+        ? { cx: NOTCH_H / 2, cy: 46, diameter: 6, opacity: 0 }
+        : { cx: 46, cy: 16, diameter: 6, opacity: 0 };
     case "compact":
-      return { cx: 40, cy: 16, diameter: 20, opacity: 1 };
+      // Standing on its end the pill keeps Mochi at the same 40 px from the end,
+      // now the top one, and centred across the 32 px width.
+      return upright
+        ? { cx: NOTCH_H / 2, cy: 40, diameter: 20, opacity: 1 }
+        : { cx: 40, cy: 16, diameter: 20, opacity: 1 };
     case "expanded": {
       const layout = VIEW_LAYOUTS[view];
+      if (usesUprightLayout(dock, view)) {
+        // Mochi stays at the left of its card, as in the wide layout. In the
+        // overview that card is the top one (the pills drop below it), so its
+        // centre is fixed; every other view is one card spanning the whole height.
+        const cy = view === "overview" ? 42 + 108 / 2 : 42 + (islandH - 52) / 2;
+        return { cx: layout.botX, cy, diameter: layout.botDiameter, opacity: 1 };
+      }
       if (view === "uploading") {
         return {
           cx: 36 + uploadProgress * 526,

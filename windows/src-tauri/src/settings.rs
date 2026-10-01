@@ -20,10 +20,26 @@ pub struct Settings {
     /// Defaulted explicitly so a settings.json written by an older build still loads.
     #[serde(default = "default_model")]
     pub model: String,
+    /// Where the island lives: "top" (the notch spot, the default), "left" / "right"
+    /// (a vertical strip on that screen edge) or "free" (a horizontal pill left
+    /// wherever it was dropped). Written by the drag in island.rs, never by the
+    /// settings window, so `save_settings` keeps the stored value.
+    #[serde(default = "default_dock")]
+    pub dock: String,
+    /// left / right: where the strip's centre sits along the edge. free: where the
+    /// pill's top-centre sits. Logical px from the top-left of the chosen display.
+    #[serde(default)]
+    pub dock_x: f64,
+    #[serde(default)]
+    pub dock_y: f64,
 }
 
 fn default_model() -> String {
     crate::claude::DEFAULT_MODEL.to_string()
+}
+
+fn default_dock() -> String {
+    "top".to_string()
 }
 
 impl Default for Settings {
@@ -43,6 +59,9 @@ impl Default for Settings {
             autostart: false,
             hooks_installed: false,
             model: default_model(),
+            dock: default_dock(),
+            dock_x: 0.0,
+            dock_y: 0.0,
         }
     }
 }

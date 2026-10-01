@@ -16,9 +16,15 @@ interface HookPayload {
   hook_event_name?: string;
   /** "claude" (the default) or "codex" — see `coucou-hook --agent`. */
   agent?: string;
+  /** The window the session's terminal lives in (found by the relay; absent if unknown). */
+  terminal_hwnd?: number;
+  terminal_pid?: number;
+  terminal_exe?: string;
   request_id?: string;
   session_id?: string;
   cwd?: string;
+  /** The folder the agent was started in; unlike `cwd` it does not follow a `cd`. Empty if unknown. */
+  project_dir?: string;
   message?: string;
   /** Codex's Stop carries the last answer here instead of `message`. */
   last_assistant_message?: string | null;
@@ -109,7 +115,10 @@ function approvalTarget(tool: string, input: Record<string, unknown>): string {
 function upsert(id: string, projectName: string, cwd: string) {
   const t = State.tasks.find((x) => x.id === id);
   if (!t) return;
-  t.name = projectName;
+  // A session keeps the name it was first given. The working directory wanders
+  // inside one run (every `cd`), and a pill whose label changes under the cursor
+  // is a pill that is hard to click.
+  if (!t.sessionId || !t.sessionCwd) t.name = projectName;
   if (cwd) t.sessionCwd = cwd;
 }
 
@@ -137,15 +146,31 @@ function handleHook(island: Island, payload: HookPayload) {
 
   // An agent we have no pill for (a future one, or a typo) is handed straight
   // back to its terminal rather than left waiting on a card nobody will see.
-  const id = AGENT_TASK_IDS[payload.agent ?? "claude"];
-  if (!id) {
+  const agent = payload.agent ?? "claude";
+  const baseId = AGENT_TASK_IDS[agent];
+  if (!baseId) {
     if (payload.request_id) void Bridge.approvalDecline(payload.request_id);
     return;
+  }
+  // One pill per live session, i.e. per terminal: the first event of a session
+  // makes it. An event with no session id falls back to the agent's own pill.
+  const session = payload.session_id ? State.ensureSession(agent, payload.session_id) : null;
+  const id = session?.id ?? baseId;
+  const owner = State.tasks.find((t) => t.id === id);
+  if (owner) {
+    owner.lastEvent = performance.now();
+    // The relay only looks the window up on some events; keep the last one it found.
+    if (payload.terminal_hwnd) {
+      owner.terminalHwnd = payload.terminal_hwnd;
+      owner.terminalPid = payload.terminal_pid ?? null;
+      owner.terminalExe = payload.terminal_exe ?? null;
+    }
   }
 
   const name = payload.hook_event_name ?? "";
   const cwd = payload.cwd ?? "";
-  const raw = lastPathComponent(cwd);
+  // Name the session after its project root when the agent told us one.
+  const raw = lastPathComponent(payload.project_dir || cwd);
   const projectName = aliasProjectName(raw || "Session");
   const focused = State.focusId === id;
 
@@ -231,8 +256,13 @@ function handleHook(island: Island, payload: HookPayload) {
       break;
 
     case "SessionEnd":
-      State.updateTask(id, "idle");
-      clearSession(id);
+      // A session's pill goes with it; an agent's own pill just goes quiet.
+      if (session) {
+        State.endSession(id);
+      } else {
+        State.updateTask(id, "idle");
+        clearSession(id);
+      }
       break;
 
     // Codex: the turn was interrupted from the terminal.

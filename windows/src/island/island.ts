@@ -2,15 +2,16 @@
 // Mirrors IslandRootView.swift + IslandWindowController.swift.
 
 import { Tracked, Spring, clamp } from "../core/anim";
-import { Bridge, IS_TAURI, onDragDrop } from "../core/bridge";
+import { Bridge, IS_TAURI, onDragDrop, type Placement } from "../core/bridge";
 import {
   EXPANDED_CORNER, EXPANDED_W, NOTCH_W, PANEL_H, PANEL_W,
   ROUNDED_CORNER, VIEW_LAYOUTS, botGlowColor, botGlowOpacity, botPosition, chatPromptHeight,
-  islandSize,
-  type IslandMode, type IslandViewName,
+  islandSize, isVertical, usesUprightLayout,
+  type DockKind, type IslandMode, type IslandViewName,
 } from "../core/layout";
 import { Sound } from "../core/sound";
 import { isAgentTask, State } from "../core/state";
+import { openTaskTerminal } from "../core/terminal";
 import { BotEngine, hexToRGB } from "../mochi/engine";
 import { Greeting } from "../mochi/greeting";
 import { createMiniBot, pruneMiniBots, syncMiniBotStates, tickMiniBots } from "../mochi/minibots";
@@ -31,6 +32,26 @@ const UPLOAD_VIEWS: ReadonlySet<IslandViewName> = new Set(["upload", "uploading"
 const PRE_PROGRESS = USC.T_PROG_START - USC.T_DROP;
 
 const modeOrder = (m: IslandMode) => (m === "hidden" ? 0 : m === "compact" ? 1 : 2);
+
+/** Pixels the mouse has to travel with the button down before a press becomes a drag. */
+const DRAG_THRESHOLD = 6;
+
+/**
+ * Round the corners that are not against the screen edge: the notch spot hangs
+ * from the top, a side strip leans on its edge, a free pill has none to lean on.
+ */
+function cornerRadius(dock: DockKind, r: number): string {
+  switch (dock) {
+    case "left":
+      return `0 ${r}px ${r}px 0`;
+    case "right":
+      return `${r}px 0 0 ${r}px`;
+    case "free":
+      return `${r}px`;
+    default:
+      return `0 0 ${r}px ${r}px`;
+  }
+}
 
 export class Island {
   readonly fsm = new IslandStateMachine();
@@ -65,6 +86,15 @@ export class Island {
   private lastFrame = 0;
   private dirty = true;
   private canvasPx = 0;
+
+  /** Where the island lives, and where it hangs inside the window (see `place`). */
+  private dock: DockKind = "top";
+  private anchor = { x: PANEL_W / 2, y: 0 };
+  /** A press on the island that may still turn into a drag, and a drag Rust now owns. */
+  private pressStart: { x: number; y: number } | null = null;
+  private dragging = false;
+  /** Rows of agent pills last laid out, to notice when the overview should resize. */
+  private pillRows = 3;
 
   // Rust starts the window at full size so the launch greeting has room.
   private collapsed = false;
@@ -111,10 +141,7 @@ export class Island {
         State.setFocus(id);
         Sound.play("blip");
       },
-      openTerminal: () => {
-        const cwd = State.focusTask?.sessionCwd ?? null;
-        void Bridge.openInVSCode(cwd);
-      },
+      openTerminal: () => void openTaskTerminal(State.focusTask),
       // The ↗ button — same targets as openAgentTarget() on macOS.
       openTarget: () => {
         const task = State.focusTask;
@@ -127,7 +154,7 @@ export class Island {
           integration_notion: "https://notion.so",
           integration_calcom: "https://app.cal.com/bookings",
         };
-        if (isAgentTask(task)) void Bridge.openInVSCode(task.sessionCwd ?? null);
+        if (isAgentTask(task)) void openTaskTerminal(task);
         else if (task.id === "integration_n8n") void Bridge.openN8n();
         else if (urls[task.id]) void Bridge.openUrl(urls[task.id]);
       },
@@ -170,6 +197,8 @@ export class Island {
     };
 
     this.wakeStrip = h("div", { id: "wake-strip" });
+    // Only the collapsed window is the strip; otherwise it must not catch the mouse.
+    this.wakeStrip.style.display = "none";
     this.botGlow = h("div", { id: "bot-glow" });
     this.botCanvas = h("canvas", { id: "bot-canvas" });
     this.greetingCanvas = h("canvas", { id: "greeting-canvas" });
@@ -450,7 +479,9 @@ export class Island {
   // ── Geometry ────────────────────────────────────────────────────────────────
 
   private targetSize(): { w: number; h: number; r: number } {
-    const { w, h } = islandSize(State.mode, State.view, State.chatHistory.length);
+    const { w, h } = islandSize(
+      State.mode, State.view, State.chatHistory.length, this.dock, State.otherTasks.length,
+    );
     const r = State.mode === "expanded" ? EXPANDED_CORNER : ROUNDED_CORNER;
     return { w, h, r };
   }
@@ -469,24 +500,55 @@ export class Island {
     this.ensureRunning();
   }
 
+  /**
+   * Top-left of an island of this size, hung from the anchor Rust gave us: top and
+   * free hang by the top-centre, a side dock by the middle of the edge it leans on.
+   * Clamped inside the window, so a view too big for where it was dropped slides
+   * inwards instead of off the screen.
+   */
+  private place(w: number, h: number): { x: number; y: number } {
+    const a = this.anchor;
+    switch (this.dock) {
+      case "left":
+        return { x: 0, y: clamp(a.y - h / 2, 0, PANEL_H - h) };
+      case "right":
+        return { x: PANEL_W - w, y: clamp(a.y - h / 2, 0, PANEL_H - h) };
+      default:
+        return { x: clamp(a.x - w / 2, 0, PANEL_W - w), y: clamp(a.y, 0, PANEL_H - h) };
+    }
+  }
+
   private applyGeometry() {
     const w = this.width.value;
     const hh = this.height.value;
     const r = this.radius.value;
-    this.islandEl.style.width = `${w}px`;
-    this.islandEl.style.height = `${hh}px`;
-    this.islandEl.style.borderRadius = `0 0 ${r}px ${r}px`;
-    this.islandEl.style.transform = `translateX(-50%)`;
+    const pos = this.place(w, hh);
+    const s = this.islandEl.style;
+    s.width = `${w}px`;
+    s.height = `${hh}px`;
+    s.left = `${pos.x}px`;
+    s.top = `${pos.y}px`;
+    s.transform = "none";
+    s.borderRadius = cornerRadius(this.dock, r);
     // These follow the island as it resizes, so they belong here rather than in
-    // the state-driven DOM sync.
-    this.miniGrid.style.left = `${w - 40 - 14.5}px`;
-    this.miniGrid.style.top = `${hh / 2 - 14.5}px`;
+    // the state-driven DOM sync. The mini bots sit at the far end of the compact
+    // pill: right when it lies down, bottom when it stands up.
+    if (isVertical(this.dock)) {
+      this.miniGrid.style.left = `${w / 2 - 14.5}px`;
+      this.miniGrid.style.top = `${hh - 40 - 14.5}px`;
+    } else {
+      this.miniGrid.style.left = `${w - 40 - 14.5}px`;
+      this.miniGrid.style.top = `${hh / 2 - 14.5}px`;
+    }
     this.greetingCanvas.style.left = `${(w - EXPANDED_W) / 2}px`;
     this.uploadCanvas.el.style.left = `${(w - EXPANDED_W) / 2}px`;
 
-    const rect = { x: (PANEL_W - w) / 2, y: 0, w, h: hh };
+    const rect = { x: pos.x, y: pos.y, w, h: hh };
     const p = this.pushedRect;
-    if (Math.abs(p.x - rect.x) > 0.5 || Math.abs(p.w - rect.w) > 0.5 || Math.abs(p.h - rect.h) > 0.5) {
+    if (
+      Math.abs(p.x - rect.x) > 0.5 || Math.abs(p.y - rect.y) > 0.5 ||
+      Math.abs(p.w - rect.w) > 0.5 || Math.abs(p.h - rect.h) > 0.5
+    ) {
       this.pushedRect = rect;
       void Bridge.setIslandRect(rect.x, rect.y, rect.w, rect.h);
     }
@@ -496,7 +558,29 @@ export class Island {
   private islandRect(): { x: number; y: number; w: number; h: number } {
     const w = this.width.value;
     const hh = this.height.value;
-    return { x: (PANEL_W - w) / 2, y: 0, w, h: hh };
+    return { ...this.place(w, hh), w, h: hh };
+  }
+
+  /**
+   * Rust says where the island now lives: at launch, after a drop, and every time
+   * the window changes between its panel and wake-strip forms.
+   */
+  setPlacement(p: Placement) {
+    const changed = p.dock !== this.dock;
+    this.dock = p.dock;
+    this.anchor = { x: p.anchorX, y: p.anchorY };
+    this.dragging = false;
+    this.fsm.neverHide = p.dock === "free";
+    this.wakeStrip.style.display = this.collapsed ? "block" : "none";
+    if (changed) {
+      // Lying down and standing up are different shapes: jump, don't morph.
+      const { w, h, r } = this.targetSize();
+      this.width.jump(w);
+      this.height.jump(h);
+      this.radius.jump(r);
+    }
+    this.dirty = true;
+    this.ensureRunning();
   }
 
   // ── Window collapse (hidden → tiny wake strip, zero polling) ────────────────
@@ -506,18 +590,21 @@ export class Island {
       window.clearTimeout(this.collapseTimer);
       this.collapseTimer = null;
     }
-    if (State.mode === "hidden") {
+    // A free island never collapses: nothing at the edge could wake it again.
+    if (State.mode === "hidden" && this.dock !== "free") {
       // Let the island finish retracting, then drop the window to the wake strip:
       // from there the OS delivers no cursor events, so nothing polls at all.
       this.collapseTimer = window.setTimeout(() => {
         this.collapseTimer = null;
         if (State.mode !== "hidden") return;
         this.collapsed = true;
+        this.wakeStrip.style.display = "block";
         void Bridge.setCollapsed(true);
       }, 420);
     } else if (this.collapsed) {
       // Grow the window back before the island animates open.
       this.collapsed = false;
+      this.wakeStrip.style.display = "none";
       void Bridge.setCollapsed(false);
     }
   }
@@ -531,17 +618,46 @@ export class Island {
       if (State.mode === "hidden") this.fsm.mouseEntered();
     });
 
+    // A press on the island is either a click or the start of a drag, and only the
+    // mouse's travel tells which. So the click waits for the button to come up;
+    // once the mouse has moved far enough Rust takes over and carries the window
+    // (see island.rs), and the click never happens.
     this.islandEl.addEventListener("mousedown", (e) => {
+      if (e.button !== 0) return;
       Sound.resume();
       State.lastActivity = performance.now();
-      if (State.mode !== "expanded") {
-        this.fsm.click();
-        return;
-      }
-      if (this.isBotHit(e.clientX, e.clientY)) {
+      if (State.mode === "expanded" && this.isBotHit(e.clientX, e.clientY)) {
         this.cancelBotHover();
         this.engine.slap();
+        return;
       }
+      // Buttons, fields and links do their own thing; anything else is a handle.
+      if ((e.target as Element).closest?.("button, input, textarea, select, a, [data-nodrag]")) return;
+      this.pressStart = { x: e.screenX, y: e.screenY };
+    });
+
+    window.addEventListener("mousemove", (e) => {
+      const press = this.pressStart;
+      if (!press || this.dragging) return;
+      // The button came up somewhere we were not listening (outside the window).
+      if ((e.buttons & 1) === 0) {
+        this.pressStart = null;
+        return;
+      }
+      if (Math.hypot(e.screenX - press.x, e.screenY - press.y) < DRAG_THRESHOLD) return;
+      this.pressStart = null;
+      this.dragging = true;
+      // The `placement` event after the drop clears this; if there was nothing to
+      // grab, nothing will, so clear it here.
+      void Bridge.islandDragStart().then((started) => {
+        if (!started) this.dragging = false;
+      });
+    });
+
+    window.addEventListener("mouseup", () => {
+      const press = this.pressStart;
+      this.pressStart = null;
+      if (press && !this.dragging && State.mode !== "expanded") this.fsm.click();
     });
 
     window.addEventListener("keydown", (e) => {
@@ -733,7 +849,7 @@ export class Island {
   };
 
   private updateBotTargets() {
-    const p = botPosition(State.mode, State.view, this.height.value, State.uploadProgress);
+    const p = botPosition(State.mode, State.view, this.height.value, State.uploadProgress, this.dock);
     this.botCx.target = p.cx;
     this.botCy.target = p.cy;
     this.botSize.target = p.diameter / 0.6;
@@ -824,6 +940,17 @@ export class Island {
   private syncDom() {
     const expanded = State.mode === "expanded";
     const greetingActive = expanded && State.view === "greeting";
+
+    // Standing on a side edge, most views open as a narrow column (see layout.ts).
+    const upright = expanded && usesUprightLayout(this.dock, State.view);
+    this.islandEl.classList.toggle("upright", upright);
+    // In that column the overview is as tall as its pills need: grow or shrink when
+    // a terminal comes or goes.
+    const rows = Math.min(3, Math.max(1, Math.ceil(Math.min(State.otherTasks.length, 6) / 2)));
+    if (rows !== this.pillRows) {
+      this.pillRows = rows;
+      if (upright && State.view === "overview") this.animateGeometry(false);
+    }
 
     this.contentEl.style.opacity = expanded && !greetingActive ? "1" : "0";
     this.contentEl.style.pointerEvents = expanded && !greetingActive ? "auto" : "none";

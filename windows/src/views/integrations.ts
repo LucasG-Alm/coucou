@@ -6,7 +6,8 @@
 
 import { h, svg, clear, dot } from "./dom";
 import { ICONS } from "./icons";
-import { defaultTaskName, isAgentTask, State, type AgentTask } from "../core/state";
+import { AGENT_LABEL, isAgentTask, State, taskLabel, type AgentTask } from "../core/state";
+import { openTaskTerminal } from "../core/terminal";
 import { Bridge } from "../core/bridge";
 
 /** Same shape as the Swift `timeAgo` computed properties. */
@@ -55,16 +56,27 @@ const OPEN_URLS: Record<string, string> = {
 
 function idleCard(task: AgentTask, openSettings: () => void): HTMLElement {
   const info = State.integrations[task.id];
-  const configured = info?.configured ?? false;
+  // A live session is proof the hooks are in: only an agent's own pill asks.
+  const configured = task.sessionId ? true : (info?.configured ?? false);
   const error = info?.error ?? null;
   // The AI pills are about hooks, not a key — the macOS wording would be
   // misleading here.
   const missing = isAgentTask(task) ? "Hooks not installed" : "Key not configured";
-  const label = error ?? (configured ? "Connected · loading…" : missing);
+  const label =
+    error ?? (task.sessionId ? "Waiting for a prompt" : configured ? "Connected · loading…" : missing);
   const statusColor = error || !configured ? "#F4505E" : "#22C55E";
 
   const actions = h("div", { class: "int-actions" });
-  if (task.id === "integration_claude") {
+  if (task.sessionId) {
+    actions.append(
+      h("button", {
+        class: "link-btn",
+        style: `color:${task.color}b3`,
+        text: task.terminalHwnd ? "Open terminal" : "Open folder",
+        onclick: () => void openTaskTerminal(task),
+      }),
+    );
+  } else if (task.id === "integration_claude") {
     actions.append(
       h("button", {
         class: "link-btn",
@@ -110,7 +122,7 @@ function idleCard(task: AgentTask, openSettings: () => void): HTMLElement {
   return h(
     "div",
     { class: "int-card" },
-    header(task.color, defaultTaskName(task.id), "Integration"),
+    header(task.color, taskLabel(task, State.tasks), task.sessionId ? AGENT_LABEL[task.source] : "Integration"),
     h("div", { class: "int-status" }, dot(statusColor, 5), h("span", { text: label })),
     actions,
   );

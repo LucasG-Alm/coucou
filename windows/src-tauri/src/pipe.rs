@@ -126,7 +126,7 @@ async fn handle(app: AppHandle, mut pipe: NamedPipeServer) {
         .to_string();
 
     if event != "PermissionRequest" {
-        log::line(format!("hook {event}"));
+        log::line(format!("hook {event} {}", who(&payload)));
         let _ = app.emit_to(WINDOW_LABEL, "hook", payload);
         let _ = pipe.disconnect();
         return;
@@ -139,7 +139,7 @@ async fn handle(app: AppHandle, mut pipe: NamedPipeServer) {
         pending.0.lock().unwrap().insert(id.clone(), tx);
     }
     payload["request_id"] = json!(id);
-    log::line(format!("hook PermissionRequest id={id}"));
+    log::line(format!("hook PermissionRequest id={id} {}", who(&payload)));
     let _ = app.emit_to(WINDOW_LABEL, "hook", payload);
 
     let decision = wait_for_decision(&id, &mut rx).await;
@@ -152,6 +152,19 @@ async fn handle(app: AppHandle, mut pipe: NamedPipeServer) {
         let _ = pipe.flush().await;
     }
     let _ = pipe.disconnect();
+}
+
+/// Which agent, session and terminal an event is from, for the log: without it
+/// "hook PreToolUse" cannot tell one terminal from another.
+fn who(payload: &Value) -> String {
+    let text = |k: &str| payload.get(k).and_then(Value::as_str).unwrap_or("");
+    let session: String = text("session_id").chars().take(8).collect();
+    let terminal = payload
+        .get("terminal_hwnd")
+        .and_then(Value::as_i64)
+        .map(|h| format!("{h:#x}"))
+        .unwrap_or_else(|| "-".into());
+    format!("agent={} session={} terminal={}", text("agent"), session, terminal)
 }
 
 /// Two waits: a short one for "the card is up", then the long one for a human.

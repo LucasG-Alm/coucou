@@ -1,7 +1,7 @@
 // Entry point: boot the bridge, wire the island, start the greeting.
 
 import "./style.css";
-import { Bridge, IS_TAURI, onEvent } from "./core/bridge";
+import { Bridge, IS_TAURI, onEvent, type Placement } from "./core/bridge";
 import { Sound } from "./core/sound";
 import { State, type Settings } from "./core/state";
 import { Island } from "./island/island";
@@ -22,6 +22,12 @@ async function main() {
   }
   island.applySettings();
   State.loadIntegrationTasks();
+
+  // Where the island lives: dragged there last time, or the notch spot. Listen
+  // first, then ask, so a placement sent in between is not lost.
+  await onEvent<Placement>("placement", (p) => island.setPlacement(p));
+  const placement = await Bridge.placement();
+  if (placement) island.setPlacement(placement);
 
   await onEvent<{ x: number; y: number }>("cursor", ({ x, y }) => island.onCursor(x, y));
 
@@ -62,6 +68,19 @@ async function main() {
 
   registerHookHandlers(island);
   registerIntegrationHandlers(island);
+
+  // A terminal closed without saying goodbye (no SessionEnd) would leave its pill
+  // behind for good: every half minute, drop the sessions whose window is gone and
+  // the ones that have been idle for hours.
+  window.setInterval(async () => {
+    State.pruneIdleSessions();
+    const terminals = State.sessionTerminals;
+    if (!terminals.length) return;
+    const alive = await Bridge.terminalsAlive(terminals.map((t) => [t.hwnd, t.pid]));
+    alive?.forEach((ok, i) => {
+      if (!ok) State.endSession(terminals[i].id);
+    });
+  }, 30_000);
 
   island.launch();
 

@@ -20,6 +20,8 @@ export const ICONS = {
   // chevron.right
   chevronRight: "M9 5.5 15.5 12 9 18.5",
   chevronLeft: "M15 5.5 8.5 12 15 18.5",
+  // minus (minimize: drawn as a stroke)
+  minus: "M6 12h12",
   // checkmark
   check: "M5 12.5 9.5 17 19 7.5",
   // arrow.up (send)

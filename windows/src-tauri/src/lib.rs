@@ -9,6 +9,7 @@ mod log;
 mod pipe;
 mod secrets;
 mod settings;
+mod terminal;
 mod tray;
 mod win_user;
 
@@ -60,9 +61,15 @@ fn boot(app: AppHandle, shared: State<Shared>) -> BootInfo {
 }
 
 #[tauri::command]
-fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
+fn save_settings(app: AppHandle, shared: State<Shared>, mut settings: Settings) {
     let (screen_changed, autostart_changed) = {
         let mut current = shared.settings.lock().unwrap();
+        // Where the island sits is owned by the drag (island.rs). Whoever saves —
+        // the island or the settings window — may be holding an older copy, and
+        // must not drag it back to where it used to be.
+        settings.dock = current.dock.clone();
+        settings.dock_x = current.dock_x;
+        settings.dock_y = current.dock_y;
         let screen_changed = current.screen != settings.screen;
         let autostart_changed = current.autostart != settings.autostart;
         *current = settings.clone();
@@ -90,13 +97,34 @@ fn save_settings(app: AppHandle, shared: State<Shared>, settings: Settings) {
 /// cursor poll; anything else → full panel and 60 Hz polling.
 #[tauri::command]
 fn set_collapsed(app: AppHandle, shared: State<Shared>, collapsed: bool) {
-    let pref = shared.settings.lock().unwrap().screen.clone();
+    let (pref, dock) = {
+        let s = shared.settings.lock().unwrap();
+        (s.screen.clone(), island::Dock::parse(&s.dock))
+    };
+    // A free island never hides: there is no edge to wake it from, and a parked
+    // window would sit there swallowing clicks.
+    let collapsed = collapsed && dock != island::Dock::Free;
     shared.gate.collapsed.store(collapsed, Ordering::Relaxed);
     island::apply_geometry(&app, &pref, collapsed);
     // The wake strip must always take the mouse, and a resize invalidates the flag.
     island::set_ignore_cursor(&app, false);
     shared.gate.forget_ignore_state();
     shared.gate.set_active(!collapsed);
+}
+
+/// The mouse went down on the island and moved: carry the window with the cursor
+/// until the button is released, then dock it. Returns false if there was nothing
+/// to grab, so the page does not wait for a drop that will never come.
+#[tauri::command]
+fn island_drag_start(app: AppHandle, shared: State<Shared>) -> bool {
+    island::begin_drag(&app, &shared.gate)
+}
+
+/// Where the island hangs in its window, for a page that loaded after the last
+/// `placement` event was sent.
+#[tauri::command]
+fn get_placement(shared: State<Shared>) -> island::Placement {
+    shared.gate.placement.lock().unwrap().clone()
 }
 
 /// The front end pushes the island shape; Rust decides click-through from it.
@@ -132,8 +160,24 @@ fn open_url(url: String) {
         .spawn();
 }
 
+/// Brings a session's terminal window to the front. `hwnd` and `pid` are what the
+/// relay found for that session; false if the window is gone, so the caller can
+/// fall back to something else.
+#[tauri::command]
+fn focus_terminal(hwnd: i64, pid: u32) -> bool {
+    terminal::focus(hwnd, pid)
+}
+
+/// For each (hwnd, pid), whether that terminal window still exists. Lets the island
+/// drop the pill of a terminal that was closed without saying goodbye.
+#[tauri::command]
+fn terminals_alive(windows: Vec<(i64, u32)>) -> Vec<bool> {
+    windows.into_iter().map(|(h, p)| terminal::alive(h, p)).collect()
+}
+
 /// "Open terminal" opens the working folder in VS Code when `code` is on PATH,
-/// and falls back to Explorer otherwise.
+/// and falls back to Explorer otherwise. Used when the session's own terminal
+/// window is not known; see `focus_terminal`.
 #[tauri::command]
 fn open_in_vscode(path: Option<String>) -> bool {
     // No `cmd /C` anywhere near this. The path is a project folder chosen by
@@ -391,6 +435,10 @@ pub fn run() {
             save_settings,
             set_collapsed,
             set_island_rect,
+            island_drag_start,
+            get_placement,
+            focus_terminal,
+            terminals_alive,
             focus_window,
             reposition,
             open_url,

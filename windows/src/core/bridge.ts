@@ -5,6 +5,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import type { DockKind } from "./layout";
 import type { Settings } from "./state";
 
 export const IS_TAURI =
@@ -48,10 +49,26 @@ export const Bridge = {
 
   reposition: () => call<void>("reposition"),
 
+  /**
+   * The mouse went down on the island and moved: Rust carries the window with the
+   * cursor, then docks it on release and sends a `placement` event. False if
+   * there was nothing to grab.
+   */
+  islandDragStart: async () => (await call<boolean>("island_drag_start")) ?? false,
+  /** Where the island hangs in its window right now. */
+  placement: () => call<Placement>("get_placement"),
+
   openUrl: (url: string) => call<void>("open_url", { url }),
 
   /** "Open terminal" → opens the folder in VS Code when `code` is on PATH. */
   openInVSCode: (path: string | null) => call<boolean>("open_in_vscode", { path }),
+
+  /** Brings a session's terminal window to the front. False if it is gone. */
+  focusTerminal: async (hwnd: number, pid: number) =>
+    (await call<boolean>("focus_terminal", { hwnd, pid })) ?? false,
+  /** For each terminal window, whether it still exists. Null outside the app. */
+  terminalsAlive: (windows: [number, number][]) =>
+    call<boolean[]>("terminals_alive", { windows }),
 
   quit: () => call<void>("quit_app"),
 
@@ -117,6 +134,16 @@ export interface DroppedFile {
   name: string;
   path: string;
   size: number;
+}
+
+/**
+ * Where the island lives and where it hangs inside its window (window-logical px):
+ * top / free → its top-centre, left → its left-centre, right → its right-centre.
+ */
+export interface Placement {
+  dock: DockKind;
+  anchorX: number;
+  anchorY: number;
 }
 
 /** Whose hook file: Claude Code's settings.json or Codex's hooks.json. */

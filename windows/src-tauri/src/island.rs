@@ -4,6 +4,12 @@
 // There is no notch on a PC, so the island is a black shape drawn at the top
 // centre of the main display inside a borderless, transparent, always-on-top
 // window that never takes focus.
+//
+// The user can drag it elsewhere (Settings::dock): onto the left or right edge,
+// where it becomes a vertical strip, or anywhere else, where it stays a
+// horizontal pill. The window is always the same 720×320 canvas; only where it
+// sits, and where the island hangs inside it (the "anchor"), changes. The drag
+// itself runs in the cursor poll below, which already reads the mouse every frame.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -35,6 +41,148 @@ pub const WINDOW_LABEL: &str = "island";
 /// Margin around the island that still counts as "on the island", in logical px.
 /// Wider than the macOS 6 pt because a click must never be swallowed.
 const HIT_MARGIN: f64 = 14.0;
+
+/// How close to a screen edge a drop has to land to dock there, in logical px.
+pub const SNAP: f64 = 56.0;
+
+/// Where on the screen the island lives. See `Settings::dock`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dock {
+    Top,
+    Left,
+    Right,
+    Free,
+}
+
+impl Dock {
+    /// Anything unrecognised — a hand-edited or older settings.json — is the notch spot.
+    pub fn parse(name: &str) -> Dock {
+        match name {
+            "left" => Dock::Left,
+            "right" => Dock::Right,
+            "free" => Dock::Free,
+            _ => Dock::Top,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Dock::Top => "top",
+            Dock::Left => "left",
+            Dock::Right => "right",
+            Dock::Free => "free",
+        }
+    }
+}
+
+/// A rectangle in logical px.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Rect {
+    pub x: f64,
+    pub y: f64,
+    pub w: f64,
+    pub h: f64,
+}
+
+/// Where the window goes (logical screen px) and where the island hangs inside it
+/// (logical window px): top and free → the island's top-centre, left → its
+/// left-centre, right → its right-centre.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Geometry {
+    pub win: Rect,
+    pub anchor_x: f64,
+    pub anchor_y: f64,
+}
+
+/// What the front end needs to draw the island in the right spot.
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct Placement {
+    pub dock: String,
+    pub anchor_x: f64,
+    pub anchor_y: f64,
+}
+
+impl Default for Placement {
+    fn default() -> Self {
+        Placement { dock: "top".into(), anchor_x: PANEL_W / 2.0, anchor_y: 0.0 }
+    }
+}
+
+/// `v` limited to `lo..=hi`; a display too small for the window gives `lo`.
+fn clamp(v: f64, lo: f64, hi: f64) -> f64 {
+    v.min(hi).max(lo)
+}
+
+/// Where the 720×320 window (or the wake strip, when `collapsed`) goes for a dock.
+/// `dx`/`dy` are `Settings::dock_x` / `dock_y`.
+///
+/// The window is kept inside the display, and the island's anchor absorbs
+/// whatever the clamp moved: an island dropped near a corner stays exactly where
+/// it was dropped while its window slides inwards.
+pub fn window_geometry(mon: Rect, dock: Dock, dx: f64, dy: f64, collapsed: bool) -> Geometry {
+    match dock {
+        Dock::Top => {
+            let (w, h) = if collapsed { (STRIP_W, STRIP_H) } else { (PANEL_W, PANEL_H) };
+            Geometry {
+                win: Rect { x: mon.x + (mon.w - w) / 2.0, y: mon.y, w, h },
+                anchor_x: w / 2.0,
+                anchor_y: 0.0,
+            }
+        }
+        Dock::Left | Dock::Right => {
+            // Hidden, it is a vertical strip on the edge instead of a horizontal one.
+            let (w, h) = if collapsed { (STRIP_H, STRIP_W) } else { (PANEL_W, PANEL_H) };
+            let centre = mon.y + dy;
+            let y = clamp(centre - h / 2.0, mon.y, mon.y + mon.h - h);
+            let (x, anchor_x) = if dock == Dock::Left {
+                (mon.x, 0.0)
+            } else {
+                (mon.x + mon.w - w, w)
+            };
+            Geometry { win: Rect { x, y, w, h }, anchor_x, anchor_y: centre - y }
+        }
+        // A free island never hides, so there is no collapsed form to size.
+        Dock::Free => {
+            let (w, h) = (PANEL_W, PANEL_H);
+            let x = clamp(mon.x + dx - w / 2.0, mon.x, mon.x + mon.w - w);
+            let y = clamp(mon.y + dy, mon.y, mon.y + mon.h - h);
+            Geometry {
+                win: Rect { x, y, w, h },
+                anchor_x: mon.x + dx - x,
+                anchor_y: mon.y + dy - y,
+            }
+        }
+    }
+}
+
+/// Where a drop leaves the island. `island` is its rectangle on screen at the
+/// moment of release; the result is the dock plus `dock_x` / `dock_y`.
+///
+/// Sides win over the top: a drop in a corner is a request for that edge.
+pub fn classify_drop(mon: Rect, island: Rect) -> (Dock, f64, f64) {
+    let to_left = island.x - mon.x;
+    let to_right = (mon.x + mon.w) - (island.x + island.w);
+    let to_top = island.y - mon.y;
+
+    if to_left <= SNAP || to_right <= SNAP {
+        let dock = if to_left <= to_right { Dock::Left } else { Dock::Right };
+        let centre = island.y + island.h / 2.0 - mon.y;
+        return (dock, 0.0, clamp(centre, 0.0, mon.h));
+    }
+    if to_top <= SNAP {
+        return (Dock::Top, 0.0, 0.0);
+    }
+    let centre = island.x + island.w / 2.0 - mon.x;
+    (Dock::Free, clamp(centre, 0.0, mon.w), clamp(island.y - mon.y, 0.0, mon.h))
+}
+
+/// A drag in flight: where inside the window the cursor grabbed it, physical px.
+#[derive(Clone, Copy)]
+struct DragState {
+    dx: f64,
+    dy: f64,
+}
 
 #[derive(Serialize, Clone)]
 pub struct CursorPayload {
@@ -70,6 +218,10 @@ pub struct PollGate {
     pub rect: Mutex<IslandRect>,
     /// Mirrors the window flag so we only call into Win32 when it changes.
     ignoring: AtomicBool,
+    /// Set while the user is dragging the island; the poll thread then moves the window.
+    drag: Mutex<Option<DragState>>,
+    /// The last placement handed to the front end, for a page that loads later.
+    pub placement: Mutex<Placement>,
 }
 
 impl PollGate {
@@ -80,6 +232,8 @@ impl PollGate {
             collapsed: AtomicBool::new(true),
             rect: Mutex::new(IslandRect::default()),
             ignoring: AtomicBool::new(false),
+            drag: Mutex::new(None),
+            placement: Mutex::new(Placement::default()),
         }
     }
 
@@ -202,26 +356,129 @@ pub fn screen_info(app: &AppHandle, pref: &str) -> ScreenInfo {
     }
 }
 
-/// Places and sizes the window. `collapsed` picks the wake strip instead of the panel.
+/// A display as a logical-px rectangle.
+fn monitor_rect(m: &Monitor) -> Rect {
+    let scale = m.scale_factor();
+    let p = m.position();
+    let s = m.size();
+    Rect {
+        x: p.x as f64 / scale,
+        y: p.y as f64 / scale,
+        w: s.width as f64 / scale,
+        h: s.height as f64 / scale,
+    }
+}
+
+/// The dock stored in the settings, with its coordinates.
+fn stored_dock(app: &AppHandle) -> (Dock, f64, f64) {
+    match app.try_state::<crate::Shared>() {
+        Some(shared) => {
+            let s = shared.settings.lock().unwrap();
+            (Dock::parse(&s.dock), s.dock_x, s.dock_y)
+        }
+        None => (Dock::Top, 0.0, 0.0),
+    }
+}
+
+/// Places and sizes the window for the stored dock. `collapsed` picks the wake
+/// strip instead of the panel. Tells the front end where the island hangs.
 pub fn apply_geometry(app: &AppHandle, pref: &str, collapsed: bool) {
     let Some(win) = window(app) else { return };
     let Some(m) = target_monitor(app, pref) else { return };
 
     let scale = m.scale_factor();
-    let mp = *m.position();
-    let ms = *m.size();
+    let (dock, dx, dy) = stored_dock(app);
+    let geo = window_geometry(monitor_rect(&m), dock, dx, dy, collapsed);
 
-    let (lw, lh) = if collapsed { (STRIP_W, STRIP_H) } else { (PANEL_W, PANEL_H) };
-    let pw = (lw * scale).round().max(1.0) as u32;
-    let ph = (lh * scale).round().max(1.0) as u32;
-    let x = mp.x + (ms.width as i32 - pw as i32) / 2;
-    let y = mp.y;
+    let px = |v: f64| (v * scale).round() as i32;
+    let pw = px(geo.win.w).max(1) as u32;
+    let ph = px(geo.win.h).max(1) as u32;
 
     let _ = win.set_size(PhysicalSize::new(pw, ph));
-    let _ = win.set_position(PhysicalPosition::new(x, y));
+    let _ = win.set_position(PhysicalPosition::new(px(geo.win.x), px(geo.win.y)));
     // Moving across displays can rescale the window: re-assert the physical size.
     let _ = win.set_size(PhysicalSize::new(pw, ph));
     let _ = win.set_always_on_top(true);
+
+    let placement = Placement {
+        dock: dock.as_str().to_string(),
+        anchor_x: geo.anchor_x,
+        anchor_y: geo.anchor_y,
+    };
+    if let Some(shared) = app.try_state::<crate::Shared>() {
+        *shared.gate.placement.lock().unwrap() = placement.clone();
+    }
+    let _ = app.emit_to(WINDOW_LABEL, "placement", placement);
+}
+
+/// The front end saw the mouse go down on the island and then move: from here the
+/// poll thread carries the window along with the cursor until the button is up.
+/// False if there was nothing to grab.
+pub fn begin_drag(app: &AppHandle, gate: &PollGate) -> bool {
+    let Some(win) = window(app) else { return false };
+    let (Some((cx, cy)), Ok(origin)) = (cursor_physical(), win.outer_position()) else {
+        return false;
+    };
+    *gate.drag.lock().unwrap() = Some(DragState {
+        dx: cx - origin.x as f64,
+        dy: cy - origin.y as f64,
+    });
+    true
+}
+
+/// One poll tick of a drag: follow the cursor, or — once the button is up —
+/// work out where the island now lives.
+fn drive_drag(app: &AppHandle, gate: &PollGate) {
+    let Some(drag) = *gate.drag.lock().unwrap() else { return };
+    let Some(win) = window(app) else {
+        *gate.drag.lock().unwrap() = None;
+        return;
+    };
+    if left_button_down() {
+        if let Some((cx, cy)) = cursor_physical() {
+            let _ = win.set_position(PhysicalPosition::new(
+                (cx - drag.dx).round() as i32,
+                (cy - drag.dy).round() as i32,
+            ));
+        }
+        return;
+    }
+    *gate.drag.lock().unwrap() = None;
+    drop_island(app, &win, gate);
+}
+
+/// The button came up: dock (or leave free) according to where the island is, keep
+/// it in the settings and move the window to match.
+fn drop_island(app: &AppHandle, win: &WebviewWindow, gate: &PollGate) {
+    let Some(shared) = app.try_state::<crate::Shared>() else { return };
+    let pref = shared.settings.lock().unwrap().screen.clone();
+    let Some(m) = target_monitor(app, &pref) else { return };
+    let Ok(origin) = win.outer_position() else { return };
+    let scale = win.scale_factor().unwrap_or(1.0);
+
+    let r = *gate.rect.lock().unwrap();
+    let island = Rect {
+        x: origin.x as f64 / scale + r.x,
+        y: origin.y as f64 / scale + r.y,
+        w: r.w,
+        h: r.h,
+    };
+    let (dock, dx, dy) = classify_drop(monitor_rect(&m), island);
+    crate::log::line(format!("island dropped → {} ({dx:.0}, {dy:.0})", dock.as_str()));
+
+    let updated = {
+        let mut s = shared.settings.lock().unwrap();
+        s.dock = dock.as_str().to_string();
+        s.dock_x = dx;
+        s.dock_y = dy;
+        let _ = crate::settings::save(&s);
+        s.clone()
+    };
+    // The settings window keeps its own copy; without this it would save a stale one.
+    let _ = app.emit("settings-changed", updated);
+
+    let collapsed = gate.collapsed.load(Ordering::Relaxed);
+    apply_geometry(app, &pref, collapsed);
 }
 
 fn hwnd_of(win: &WebviewWindow) -> Option<HWND> {
@@ -284,6 +541,13 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
             let mut ticks: u32 = 0;
             while gate.is_active() {
                 std::thread::sleep(Duration::from_millis(16));
+
+                // A drag owns the tick: the window follows the cursor, and the
+                // release is where the island finds out where it now lives.
+                if gate.drag.lock().unwrap().is_some() {
+                    drive_drag(&app, &gate);
+                    continue;
+                }
 
                 // Monitors get plugged in, unplugged, rearranged and rescaled, and
                 // an island pinned to coordinates that no longer exist is an island
@@ -364,5 +628,157 @@ pub fn spawn_cursor_poll(app: AppHandle, gate: Arc<PollGate>) {
 pub fn set_ignore_cursor(app: &AppHandle, ignore: bool) {
     if let Some(win) = window(app) {
         let _ = win.set_ignore_cursor_events(ignore);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MON: Rect = Rect { x: 0.0, y: 0.0, w: 1920.0, h: 1080.0 };
+    /// A second display to the right of the first, not at the origin.
+    const MON2: Rect = Rect { x: 1920.0, y: 0.0, w: 1920.0, h: 1080.0 };
+
+    fn at(x: f64, y: f64, w: f64, h: f64) -> Rect {
+        Rect { x, y, w, h }
+    }
+
+    #[test]
+    fn top_is_centred_on_the_display_and_flush_to_the_top() {
+        let g = window_geometry(MON, Dock::Top, 0.0, 0.0, false);
+        assert_eq!(g.win, at(600.0, 0.0, PANEL_W, PANEL_H));
+        assert_eq!((g.anchor_x, g.anchor_y), (PANEL_W / 2.0, 0.0));
+    }
+
+    #[test]
+    fn a_collapsed_top_window_is_just_the_wake_strip() {
+        let g = window_geometry(MON, Dock::Top, 0.0, 0.0, true);
+        assert_eq!(g.win, at(840.0, 0.0, STRIP_W, STRIP_H));
+    }
+
+    #[test]
+    fn a_side_dock_sits_flush_on_its_edge_around_the_dropped_height() {
+        let l = window_geometry(MON, Dock::Left, 0.0, 500.0, false);
+        assert_eq!((l.win.x, l.win.w), (0.0, PANEL_W));
+        assert_eq!(l.win.y, 500.0 - PANEL_H / 2.0);
+        // The strip's centre is exactly where it was dropped, in window terms.
+        assert_eq!((l.anchor_x, l.anchor_y), (0.0, PANEL_H / 2.0));
+
+        let r = window_geometry(MON, Dock::Right, 0.0, 500.0, false);
+        assert_eq!(r.win.x, 1920.0 - PANEL_W, "flush to the right edge");
+        assert_eq!(r.anchor_x, PANEL_W, "the island hangs from the window's right side");
+    }
+
+    #[test]
+    fn a_side_window_never_leaves_the_display_and_the_anchor_takes_the_slack() {
+        let top = window_geometry(MON, Dock::Left, 0.0, 10.0, false);
+        assert_eq!(top.win.y, 0.0);
+        assert_eq!(top.anchor_y, 10.0, "still 10 px from the top of the screen");
+
+        let bottom = window_geometry(MON, Dock::Right, 0.0, 1070.0, false);
+        assert_eq!(bottom.win.y, 1080.0 - PANEL_H);
+        assert_eq!(bottom.win.y + bottom.anchor_y, 1070.0, "still where it was dropped");
+    }
+
+    #[test]
+    fn a_collapsed_side_dock_is_a_vertical_strip_on_the_edge() {
+        let l = window_geometry(MON, Dock::Left, 0.0, 400.0, true);
+        assert_eq!(l.win, at(0.0, 400.0 - STRIP_W / 2.0, STRIP_H, STRIP_W));
+        let r = window_geometry(MON, Dock::Right, 0.0, 400.0, true);
+        assert_eq!(r.win.x, 1920.0 - STRIP_H);
+    }
+
+    #[test]
+    fn free_stays_where_it_was_dropped_with_its_window_inside_the_display() {
+        let g = window_geometry(MON, Dock::Free, 960.0, 400.0, false);
+        assert_eq!(g.win, at(600.0, 400.0, PANEL_W, PANEL_H));
+        assert_eq!((g.anchor_x, g.anchor_y), (360.0, 0.0));
+
+        // Near the right edge the window slides in; the island does not.
+        let edge = window_geometry(MON, Dock::Free, 1800.0, 400.0, false);
+        assert_eq!(edge.win.x, 1920.0 - PANEL_W);
+        assert_eq!(edge.win.x + edge.anchor_x, 1800.0);
+
+        // Near the bottom the window slides up; the island stays put.
+        let low = window_geometry(MON, Dock::Free, 960.0, 1060.0, false);
+        assert_eq!(low.win.y, 1080.0 - PANEL_H);
+        assert_eq!(low.win.y + low.anchor_y, 1060.0);
+    }
+
+    #[test]
+    fn free_never_collapses() {
+        assert_eq!(
+            window_geometry(MON, Dock::Free, 960.0, 400.0, true),
+            window_geometry(MON, Dock::Free, 960.0, 400.0, false),
+        );
+    }
+
+    #[test]
+    fn a_display_smaller_than_the_window_does_not_panic_or_go_negative() {
+        let tiny = at(0.0, 0.0, 500.0, 300.0);
+        for dock in [Dock::Top, Dock::Left, Dock::Right, Dock::Free] {
+            let g = window_geometry(tiny, dock, 250.0, 150.0, false);
+            assert!(g.win.w > 0.0 && g.win.h > 0.0);
+        }
+    }
+
+    #[test]
+    fn dropping_near_a_side_docks_there_and_remembers_the_height() {
+        // The compact horizontal pill (288×32), left edge 20 px away, at y=600.
+        let (dock, _, y) = classify_drop(MON, at(20.0, 584.0, 288.0, 32.0));
+        assert_eq!(dock, Dock::Left);
+        assert_eq!(y, 600.0, "the strip's centre, not the pill's top");
+
+        let (dock, _, _) = classify_drop(MON, at(1920.0 - 288.0 - 10.0, 300.0, 288.0, 32.0));
+        assert_eq!(dock, Dock::Right);
+    }
+
+    #[test]
+    fn a_vertical_strip_dragged_a_little_stays_docked() {
+        // 32 wide × 288 tall on the left edge, nudged 30 px inwards and 100 px down.
+        let (dock, _, y) = classify_drop(MON, at(30.0, 300.0, 32.0, 288.0));
+        assert_eq!(dock, Dock::Left);
+        assert_eq!(y, 444.0);
+    }
+
+    #[test]
+    fn sides_beat_the_top_in_a_corner() {
+        let (dock, _, _) = classify_drop(MON, at(10.0, 10.0, 288.0, 32.0));
+        assert_eq!(dock, Dock::Left);
+    }
+
+    #[test]
+    fn dropping_near_the_top_goes_back_to_the_notch() {
+        let (dock, dx, dy) = classify_drop(MON, at(700.0, 30.0, 288.0, 32.0));
+        assert_eq!((dock, dx, dy), (Dock::Top, 0.0, 0.0));
+    }
+
+    #[test]
+    fn dropping_in_the_middle_leaves_it_free_at_the_drop_point() {
+        let (dock, x, y) = classify_drop(MON, at(800.0, 500.0, 288.0, 32.0));
+        assert_eq!(dock, Dock::Free);
+        assert_eq!((x, y), (944.0, 500.0), "centre x, top y");
+    }
+
+    #[test]
+    fn a_display_not_at_the_origin_is_measured_from_its_own_corner() {
+        // Same drop as above, but on the second display: 20 px from *its* left edge.
+        let (dock, _, y) = classify_drop(MON2, at(1940.0, 584.0, 288.0, 32.0));
+        assert_eq!((dock, y), (Dock::Left, 600.0));
+
+        let g = window_geometry(MON2, Dock::Left, 0.0, 600.0, false);
+        assert_eq!(g.win.x, 1920.0, "flush to the second display's left edge");
+
+        let (dock, x, _) = classify_drop(MON2, at(2720.0, 500.0, 288.0, 32.0));
+        assert_eq!((dock, x), (Dock::Free, 944.0), "relative to the display, not the desktop");
+    }
+
+    #[test]
+    fn dock_names_round_trip_and_anything_else_is_the_notch() {
+        for dock in [Dock::Top, Dock::Left, Dock::Right, Dock::Free] {
+            assert_eq!(Dock::parse(dock.as_str()), dock);
+        }
+        assert_eq!(Dock::parse(""), Dock::Top);
+        assert_eq!(Dock::parse("bottom"), Dock::Top);
     }
 }

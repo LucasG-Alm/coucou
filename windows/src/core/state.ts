@@ -1,6 +1,6 @@
 // App state — mirror of AppState.swift (the parts the island needs).
 
-import type { BotEmoteName, BotStateName, IslandMode, IslandViewName } from "./layout";
+import type { BotEmoteName, BotStateName, DockKind, IslandMode, IslandViewName } from "./layout";
 import type { EyeShape } from "../mochi/engine";
 
 export type AgentSource = "claudeCode" | "codex" | "n8n" | "agent";
@@ -19,6 +19,17 @@ export interface AgentTask {
   miniEye?: EyeShape | null;
   pillBadge?: PillBadge | null;
   sessionCwd?: string | null;
+  /**
+   * Set on a task that stands for one live session — one terminal, one agent run —
+   * rather than for the agent itself. Its `id` is `<agent task id>#<session id>`.
+   */
+  sessionId?: string;
+  /** The window that session's terminal lives in, as found by the relay. */
+  terminalHwnd?: number | null;
+  terminalPid?: number | null;
+  terminalExe?: string | null;
+  /** performance.now() of the session's last event, to retire the ones that go quiet. */
+  lastEvent?: number;
 }
 
 export interface ApprovalInfo {
@@ -94,8 +105,27 @@ export const AGENT_LABEL: Record<AgentSource, string> = {
 export const isAgentTask = (t: AgentTask): boolean => t.source !== "n8n";
 
 /** What a pill is called when no session is running. */
-export const defaultTaskName = (id: string): string =>
-  INTEGRATION_AGENTS.find((t) => t.id === id)?.name ?? id;
+export const defaultTaskName = (id: string): string => {
+  const base = id.split("#")[0];
+  return INTEGRATION_AGENTS.find((t) => t.id === base)?.name ?? id;
+};
+
+/**
+ * The label of a pill: the agent's name for an agent or an integration, and for a
+ * session the folder it runs in — with a number when two sessions of the *same
+ * agent* share a folder, so two terminals in one project can still be told apart.
+ * Different agents in one folder need no number: their colours already differ.
+ */
+export function taskLabel(task: AgentTask, all: AgentTask[]): string {
+  if (!task.sessionId) return defaultTaskName(task.id);
+  const sameName = all.filter(
+    (t) => t.sessionId && t.name === task.name && t.source === task.source,
+  );
+  return sameName.length > 1 ? `${task.name} ·${sameName.indexOf(task) + 1}` : task.name;
+}
+
+/** A session retires after this long without an event. */
+const SESSION_IDLE_MS = 3 * 60 * 60 * 1000;
 
 export const TOGGLEABLE_INTEGRATION_IDS = [
   "integration_resend", "integration_n8n", "integration_vercel", "integration_github",
@@ -121,6 +151,10 @@ export interface Settings {
   hooksInstalled: boolean;
   /** Claude model used by the chat. */
   model: string;
+  /** Where the island sits. Set by dragging it; Rust owns the stored value. */
+  dock: DockKind;
+  dockX: number;
+  dockY: number;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -135,6 +169,9 @@ export const DEFAULT_SETTINGS: Settings = {
   autostart: false,
   hooksInstalled: false,
   model: "claude-opus-5",
+  dock: "top",
+  dockX: 0,
+  dockY: 0,
 };
 
 type Listener = () => void;
@@ -144,6 +181,8 @@ class AppState {
   view: IslandViewName = "overview";
 
   tasks: AgentTask[] = [];
+  /** One entry per live terminal session; `tasks` shows these in place of the agent's own pill. */
+  private sessions: AgentTask[] = [];
   focusId: string | null = null;
 
   stateOverride: BotStateName | null = null;
@@ -228,32 +267,36 @@ class AppState {
     this.notify();
   }
 
-  /** loadIntegrationTasks() — the AI agents always on, the rest opt-in (max 4). */
+  /**
+   * loadIntegrationTasks() — the AI agents always on, the rest opt-in (max 4).
+   * An agent with live sessions shows one pill per session instead of its own, and
+   * its own pill comes back when the last session ends. Existing tasks are reused,
+   * so their state survives a rebuild.
+   */
   loadIntegrationTasks() {
+    const existing = new Map(this.tasks.map((t) => [t.id, t]));
+    const next: AgentTask[] = [];
+    // The declared order, so pills never shuffle; a session stays where it was made.
     for (const proto of INTEGRATION_AGENTS) {
-      const shouldLoad =
-        ALWAYS_ON_IDS.includes(proto.id) || this.settings.activeIntegrations.includes(proto.id);
-      const idx = this.tasks.findIndex((t) => t.id === proto.id);
-      if (shouldLoad && idx < 0) this.tasks.push({ ...proto, steps: [] });
-      if (!shouldLoad && idx >= 0) this.tasks.splice(idx, 1);
+      if (ALWAYS_ON_IDS.includes(proto.id)) {
+        const mine = this.sessions.filter((s) => s.id.startsWith(`${proto.id}#`));
+        if (mine.length) next.push(...mine);
+        else next.push(existing.get(proto.id) ?? { ...proto, steps: [] });
+      } else if (this.settings.activeIntegrations.includes(proto.id)) {
+        next.push(existing.get(proto.id) ?? { ...proto, steps: [] });
+      }
     }
-    // Order: integration_claude first, then agent_* pills (visible in slice(0,4)),
-    // then other integrations in declaration order.
-    const order = INTEGRATION_AGENTS.map((t) => t.id);
-    this.tasks.sort((a, b) => {
-      const isAgentA = a.id.startsWith("agent_");
-      const isAgentB = b.id.startsWith("agent_");
-      // integration_claude always first
-      if (a.id === "integration_claude") return -1;
-      if (b.id === "integration_claude") return 1;
-      // agent_* before other integrations; preserve insertion order among themselves
-      if (isAgentA && !isAgentB) return -1;
-      if (isAgentB && !isAgentA) return 1;
-      if (isAgentA && isAgentB) return 0;
-      // both known integrations → declaration order
-      return order.indexOf(a.id) - order.indexOf(b.id);
-    });
-    if (!this.focusId) this.focusId = "integration_claude";
+    // Third-party agent pills (coucou_agent) are not rebuilt here: keep them, right
+    // after the Claude pills so they sit inside the visible slice(0,4).
+    const external = this.tasks.filter((t) => t.id.startsWith("agent_"));
+    if (external.length) {
+      let at = next.length;
+      while (at > 0 && !next[at - 1].id.startsWith(AGENT_TASK_IDS.claude)) at--;
+      next.splice(at, 0, ...external);
+    }
+    this.tasks = next;
+    // Whatever was focused may be gone (a placeholder replaced by its session).
+    if (!next.some((t) => t.id === this.focusId)) this.focusId = next[0]?.id ?? null;
     this.notify();
   }
 
@@ -261,15 +304,16 @@ class AppState {
     const idx = this.tasks.findIndex((t) => t.id === id);
     if (idx < 0) return;
     this.tasks.splice(idx, 1);
-    if (this.focusId === id) this.focusId = this.tasks[0]?.id ?? "integration_claude";
+    if (this.focusId === id) this.focusId = this.tasks[0]?.id ?? null;
     this.notify();
   }
 
   /** Creates a dynamic agent_ pill on first event; no-ops if it already exists.
-   *  Inserted right after integration_claude so it appears in the visible slice(0,4). */
+   *  Inserted after the Claude pills so it appears in the visible slice(0,4). */
   upsertExternalAgent(id: string, name: string, color: string) {
     if (this.tasks.some((t) => t.id === id)) return;
-    const at = this.tasks.findIndex((t) => t.id === "integration_claude") + 1;
+    let at = this.tasks.length;
+    while (at > 0 && !this.tasks[at - 1].id.startsWith(AGENT_TASK_IDS.claude)) at--;
     this.tasks.splice(at, 0, {
       id, name, color,
       state: "idle", stepIndex: 0, steps: [],
@@ -279,12 +323,56 @@ class AppState {
     this.notify();
   }
 
+  /**
+   * The pill for one live session, made on its first event. Null for an agent we
+   * have no pill for.
+   */
+  ensureSession(agent: string, sessionId: string): AgentTask | null {
+    const baseId = AGENT_TASK_IDS[agent];
+    const proto = INTEGRATION_AGENTS.find((t) => t.id === baseId);
+    if (!baseId || !proto) return null;
+    const id = `${baseId}#${sessionId}`;
+    let session = this.sessions.find((s) => s.id === id);
+    if (!session) {
+      session = { ...proto, id, steps: [], sessionId, lastEvent: performance.now() };
+      this.sessions.push(session);
+      // A placeholder that held the focus hands it to the session replacing it.
+      const hadFocus = this.focusId === baseId;
+      this.loadIntegrationTasks();
+      if (hadFocus) this.focusId = id;
+    }
+    return session;
+  }
+
+  /** The session ended (or its terminal is gone): its pill goes away. */
+  endSession(id: string) {
+    const before = this.sessions.length;
+    this.sessions = this.sessions.filter((s) => s.id !== id);
+    if (this.sessions.length === before) return;
+    if (this.focusId === id) this.focusId = null;
+    this.loadIntegrationTasks();
+  }
+
+  /** The sessions that carry a terminal window, for the liveness check. */
+  get sessionTerminals(): { id: string; hwnd: number; pid: number }[] {
+    return this.sessions
+      .filter((s) => s.terminalHwnd && s.terminalPid)
+      .map((s) => ({ id: s.id, hwnd: s.terminalHwnd!, pid: s.terminalPid! }));
+  }
+
+  /** Retires the sessions that have been quiet and idle for hours. */
+  pruneIdleSessions(now = performance.now()) {
+    for (const s of [...this.sessions]) {
+      if (s.state === "idle" && now - (s.lastEvent ?? now) > SESSION_IDLE_MS) this.endSession(s.id);
+    }
+  }
+
   toggleIntegration(id: string) {
     if (ALWAYS_ON_IDS.includes(id)) return;
     const active = this.settings.activeIntegrations;
     if (active.includes(id)) {
       this.settings.activeIntegrations = active.filter((x) => x !== id);
-      if (this.focusId === id) this.focusId = "integration_claude";
+      if (this.focusId === id) this.focusId = null; // loadIntegrationTasks picks the first
     } else {
       if (active.length >= 4) return;
       this.settings.activeIntegrations = [...active, id];
