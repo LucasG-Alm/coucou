@@ -23,7 +23,7 @@ use tauri_plugin_autostart::{ManagerExt, MacosLauncher};
 
 use claude::{Chat, ChatContext, ChatReply};
 use files::DroppedFile;
-use hooks::{HookPreview, HookStatus};
+use hooks::{Agent, HookPreview, HookStatus};
 use island::{PollGate, ScreenInfo};
 use pipe::Pending;
 use settings::Settings;
@@ -49,7 +49,7 @@ pub struct BootInfo {
 fn boot(app: AppHandle, shared: State<Shared>) -> BootInfo {
     let mut settings = shared.settings.lock().unwrap().clone();
     // The real state of ~/.claude/settings.json wins over whatever we stored.
-    settings.hooks_installed = hooks::status().installed;
+    settings.hooks_installed = hooks::status(Agent::Claude).installed;
     let screen = island::screen_info(&app, &settings.screen);
     BootInfo {
         settings,
@@ -184,17 +184,18 @@ fn set_paused(paused: bool) {
     integrations::set_paused(paused);
 }
 
-// ── Claude Code hooks ─────────────────────────────────────────────────────────
+// ── Claude Code and Codex hooks ───────────────────────────────────────────────
+// `agent` is "claude" (the default, so older callers keep working) or "codex".
 
 #[tauri::command]
-fn hooks_status() -> HookStatus {
-    hooks::status()
+fn hooks_status(agent: Option<String>) -> Result<HookStatus, String> {
+    Ok(hooks::status(Agent::parse(agent.as_deref())?))
 }
 
 /// Returns the diff the user has to look at before anything is written.
 #[tauri::command]
-fn hooks_preview(install: bool) -> Result<HookPreview, String> {
-    hooks::preview(install)
+fn hooks_preview(install: bool, agent: Option<String>) -> Result<HookPreview, String> {
+    hooks::preview(Agent::parse(agent.as_deref())?, install)
 }
 
 /// Only ever called from an explicit click in the settings window.
@@ -204,17 +205,22 @@ fn hooks_apply(
     shared: State<Shared>,
     install: bool,
     fingerprint: String,
+    agent: Option<String>,
 ) -> Result<String, String> {
+    let agent = Agent::parse(agent.as_deref())?;
     // The fingerprint comes from the preview the user actually looked at, so a
-    // settings.json that changed in between is refused rather than overwritten.
-    let backup = hooks::write(install, &fingerprint)?;
-    let updated = {
-        let mut current = shared.settings.lock().unwrap();
-        current.hooks_installed = install;
-        let _ = settings::save(&current);
-        current.clone()
-    };
-    let _ = app.emit("settings-changed", updated);
+    // hook file that changed in between is refused rather than overwritten.
+    let backup = hooks::write(agent, install, &fingerprint)?;
+    // The stored flag has always meant Claude Code; Codex reads its own file.
+    if agent == Agent::Claude {
+        let updated = {
+            let mut current = shared.settings.lock().unwrap();
+            current.hooks_installed = install;
+            let _ = settings::save(&current);
+            current.clone()
+        };
+        let _ = app.emit("settings-changed", updated);
+    }
     Ok(backup)
 }
 
