@@ -32,11 +32,16 @@ export async function refreshConfigured() {
     const info = State.integrations[id] ?? { data: {}, error: null, loaded: false, configured: false };
     State.integrations[id] = { ...info, configured: present };
   }
-  const hooks = State.settings.hooksInstalled;
-  const claude = State.integrations.integration_claude ?? {
-    data: {}, error: null, loaded: false, configured: false,
+  // The AI pills are "configured" when their hooks are in place. Claude's flag is
+  // kept in the settings; Codex reads its own file, so ask Rust.
+  const hooksByAgent: Record<string, boolean> = {
+    integration_claude: State.settings.hooksInstalled,
+    integration_codex: (await Bridge.hooksStatus("codex"))?.installed ?? false,
   };
-  State.integrations.integration_claude = { ...claude, configured: hooks };
+  for (const [id, configured] of Object.entries(hooksByAgent)) {
+    const info = State.integrations[id] ?? { data: {}, error: null, loaded: false, configured: false };
+    State.integrations[id] = { ...info, configured };
+  }
   State.notify();
 }
 

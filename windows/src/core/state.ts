@@ -3,7 +3,7 @@
 import type { BotEmoteName, BotStateName, IslandMode, IslandViewName } from "./layout";
 import type { EyeShape } from "../mochi/engine";
 
-export type AgentSource = "claudeCode" | "n8n" | "agent";
+export type AgentSource = "claudeCode" | "codex" | "n8n" | "agent";
 export type PillBadge = "approval" | "finished" | "error";
 
 export interface AgentTask {
@@ -23,6 +23,8 @@ export interface AgentTask {
 
 export interface ApprovalInfo {
   requestId: string;
+  /** The task (agent pill) that asked, so Allow/Deny updates the right one. */
+  taskId: string;
   sessionId: string;
   tool: string;
   command: string;
@@ -56,9 +58,14 @@ const task = (
   id, name, color, state: "idle", stepIndex: 0, steps: [], source, isIntegration: true,
 });
 
-/** AgentTask.integrationAgents — same ids, names and colours as macOS. */
+/**
+ * AgentTask.integrationAgents — same ids, names and colours as macOS, except the
+ * AI agents: Claude Code is terracotta and Codex a bluish grey, so the Mochi tells
+ * them apart at a glance.
+ */
 export const INTEGRATION_AGENTS: AgentTask[] = [
-  task("integration_claude", "VS Code", "#F5F6F8", "claudeCode"),
+  task("integration_claude", "Claude Code", "#D97757", "claudeCode"),
+  task("integration_codex", "Codex", "#93A0B4", "codex"),
   task("integration_resend", "Resend", "#22C55E", "n8n"),
   task("integration_n8n", "n8n", "#F29B38", "n8n"),
   task("integration_vercel", "Vercel", "#7C5CFF", "n8n"),
@@ -67,6 +74,28 @@ export const INTEGRATION_AGENTS: AgentTask[] = [
   task("integration_calcom", "Cal.com", "#C9956A", "n8n"),
   task("integration_stripe", "Stripe", "#0570DE", "n8n"),
 ];
+
+/** `agent` field of a hook payload (set by `coucou-hook --agent`) → its pill. */
+export const AGENT_TASK_IDS: Record<string, string> = {
+  claude: "integration_claude",
+  codex: "integration_codex",
+};
+
+/** The AI agents are always on; only the polled integrations are opt-in. */
+const ALWAYS_ON_IDS = Object.values(AGENT_TASK_IDS);
+
+export const AGENT_LABEL: Record<AgentSource, string> = {
+  claudeCode: "Claude Code",
+  codex: "Codex",
+  n8n: "n8n",
+};
+
+/** A hook-driven AI session, as opposed to a polled integration. */
+export const isAgentTask = (t: AgentTask): boolean => t.source !== "n8n";
+
+/** What a pill is called when no session is running. */
+export const defaultTaskName = (id: string): string =>
+  INTEGRATION_AGENTS.find((t) => t.id === id)?.name ?? id;
 
 export const TOGGLEABLE_INTEGRATION_IDS = [
   "integration_resend", "integration_n8n", "integration_vercel", "integration_github",
@@ -199,11 +228,11 @@ class AppState {
     this.notify();
   }
 
-  /** loadIntegrationTasks() — VS Code always on, the rest opt-in (max 4). */
+  /** loadIntegrationTasks() — the AI agents always on, the rest opt-in (max 4). */
   loadIntegrationTasks() {
     for (const proto of INTEGRATION_AGENTS) {
       const shouldLoad =
-        proto.id === "integration_claude" || this.settings.activeIntegrations.includes(proto.id);
+        ALWAYS_ON_IDS.includes(proto.id) || this.settings.activeIntegrations.includes(proto.id);
       const idx = this.tasks.findIndex((t) => t.id === proto.id);
       if (shouldLoad && idx < 0) this.tasks.push({ ...proto, steps: [] });
       if (!shouldLoad && idx >= 0) this.tasks.splice(idx, 1);
@@ -251,7 +280,7 @@ class AppState {
   }
 
   toggleIntegration(id: string) {
-    if (id === "integration_claude") return;
+    if (ALWAYS_ON_IDS.includes(id)) return;
     const active = this.settings.activeIntegrations;
     if (active.includes(id)) {
       this.settings.activeIntegrations = active.filter((x) => x !== id);
