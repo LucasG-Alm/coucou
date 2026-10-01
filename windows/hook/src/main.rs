@@ -327,9 +327,10 @@ mod tests {
     }
 
     #[test]
-    fn a_stray_agent_value_can_only_become_a_short_lowercase_word() {
+    fn a_stray_agent_value_can_only_become_a_short_lowercase_slug() {
         assert_eq!(args(&["Stop", "--agent"]).1, "claude");
-        assert_eq!(args(&["Stop", "--agent", "Co-dex!!"]).1, "codex");
+        assert_eq!(args(&["Stop", "--agent", "Co-dex!!"]).1, "co-dex");
+        assert_eq!(args(&["Stop", "--agent", "my_tool"]).1, "mytool");
         assert_eq!(args(&["Stop", "--agent", &"x".repeat(40)]).1.len(), 24);
     }
 

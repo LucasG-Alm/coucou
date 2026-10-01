@@ -99,6 +99,7 @@ export const AGENT_LABEL: Record<AgentSource, string> = {
   claudeCode: "Claude Code",
   codex: "Codex",
   n8n: "n8n",
+  agent: "Agent",
 };
 
 /** A hook-driven AI session, as opposed to a polled integration. */

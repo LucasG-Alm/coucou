@@ -32,6 +32,22 @@ interface HookPayload {
   prompt?: string;
   tool_name?: string;
   tool_input?: Record<string, unknown>;
+  /** Third-party agent tag: lowercase, digits and hyphens, ≤ 24 chars. */
+  coucou_agent?: string;
+}
+
+/** Same rule as HookServer.validateAgent on macOS. claude/codex have their own pills. */
+function validateAgent(raw: string | undefined): string | null {
+  if (!raw || raw.length > 24 || raw === "claude" || raw === "codex") return null;
+  return /^[a-z0-9-]+$/.test(raw) ? raw : null;
+}
+
+const FALLBACK_COLORS = ["#22C55E", "#EAB308", "#60A5FA", "#E879F9"];
+
+function agentColor(name: string): string {
+  let h = 0;
+  for (let i = 0; i < name.length; i++) h = (Math.imul(31, h) + name.charCodeAt(i)) | 0;
+  return FALLBACK_COLORS[Math.abs(h) % FALLBACK_COLORS.length];
 }
 
 const PROJECT_ALIASES: Record<string, string> = {
@@ -148,14 +164,18 @@ function handleHook(island: Island, payload: HookPayload) {
   // back to its terminal rather than left waiting on a card nobody will see.
   const agent = payload.agent ?? "claude";
   const baseId = AGENT_TASK_IDS[agent];
-  if (!baseId) {
+  // Any other valid name is a third-party agent (Gemini, Antigravity…): one pill
+  // per agent, made on its first event. It has no approval card — see PermissionRequest.
+  const external = baseId ? null : validateAgent(payload.coucou_agent ?? agent);
+  if (!baseId && !external) {
     if (payload.request_id) void Bridge.approvalDecline(payload.request_id);
     return;
   }
   // One pill per live session, i.e. per terminal: the first event of a session
   // makes it. An event with no session id falls back to the agent's own pill.
-  const session = payload.session_id ? State.ensureSession(agent, payload.session_id) : null;
-  const id = session?.id ?? baseId;
+  const session = baseId && payload.session_id ? State.ensureSession(agent, payload.session_id) : null;
+  if (external) State.upsertExternalAgent(`agent_${external}`, external, agentColor(external));
+  const id = session?.id ?? baseId ?? `agent_${external}`;
   const owner = State.tasks.find((t) => t.id === id);
   if (owner) {
     owner.lastEvent = performance.now();
@@ -243,8 +263,12 @@ function handleHook(island: Island, payload: HookPayload) {
       if (focused) surface("finished", true);
       else State.setPillBadge(id, "finished");
       window.setTimeout(() => {
-        State.updateTask(id, "idle");
-        State.setPillBadge(id, null);
+        if (external) {
+          State.removeTask(id);
+        } else {
+          State.updateTask(id, "idle");
+          State.setPillBadge(id, null);
+        }
       }, 5200);
       break;
 
@@ -257,7 +281,9 @@ function handleHook(island: Island, payload: HookPayload) {
 
     case "SessionEnd":
       // A session's pill goes with it; an agent's own pill just goes quiet.
-      if (session) {
+      if (external) {
+        State.removeTask(id);
+      } else if (session) {
         State.endSession(id);
       } else {
         State.updateTask(id, "idle");
@@ -280,6 +306,12 @@ function handleHook(island: Island, payload: HookPayload) {
 
     case "PermissionRequest": {
       const requestId = payload.request_id ?? "";
+      // A third-party agent gets no card: it would look like a Claude request.
+      // Decline at once and the agent re-asks in its terminal.
+      if (external) {
+        if (requestId) void Bridge.approvalDecline(requestId);
+        break;
+      }
       // One card, one request. A second one must never quietly replace the first
       // — that would leave a human staring at request B while request A waits for
       // a decision nobody can give. Hand it straight back to the terminal.
