@@ -850,7 +850,8 @@ export class Island {
       ? settling
       : settling ||
         !this.botCx.settled || !this.botCy.settled || !this.botSize.settled ||
-        greetingActive || this.engine.busy || UploadSeq.isActive;
+        greetingActive || this.engine.busy || UploadSeq.isActive ||
+        (this.views.get(State.view)?.animating?.() ?? false);
 
     if (busy) {
       requestAnimationFrame(this.frame);

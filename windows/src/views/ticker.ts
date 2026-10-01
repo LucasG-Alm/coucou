@@ -91,6 +91,16 @@ export class Ticker {
     place(this.c, ROW_H * 2, 0, 0);
   }
 
+  /**
+   * Forget what is on screen: another task took the focus, so its steps must not
+   * scroll in after the previous task's. The next sync() seeds the rows afresh.
+   */
+  reset() {
+    this.queue = [];
+    this.startMs = null;
+    this.displayIndex = -1;
+  }
+
   get animating(): boolean {
     return this.startMs != null || this.queue.length > 0;
   }
