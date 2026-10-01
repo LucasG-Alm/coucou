@@ -20,7 +20,7 @@ export interface ViewActions {
   /** The ↗ button: opens whatever the focused pill points at. */
   openTarget(): void;
   openUrl(url: string): void;
-  decide(d: "allow" | "deny"): void;
+  decide(d: "allow" | "deny", requestId?: string): void;
   toggleSound(): void;
   setVolume(v: number): void;
   setAutoClose(seconds: number): void;
@@ -224,7 +224,12 @@ function buildOverview(actions: ViewActions): ViewHost {
       // Three rows of two fit the card; with a pill per terminal there can be more
       // than the four a lone agent ever needed.
       const others = State.otherTasks.slice(0, 6);
-      const pillKey = others.map((t) => `${t.id}:${t.pillBadge ?? ""}:${taskLabel(t, State.tasks)}`).join("|");
+      const pillKey = others
+        .map((t) => {
+          const ask = State.queuedApprovals.find((q) => q.taskId === t.id)?.requestId ?? "";
+          return `${t.id}:${t.pillBadge ?? ""}:${ask}:${taskLabel(t, State.tasks)}`;
+        })
+        .join("|");
       if (pillKey !== pillIds) {
         pillIds = pillKey;
         clear(pills);
@@ -248,6 +253,27 @@ function buildPill(task: AgentTask, actions: ViewActions): HTMLElement {
   pill.style.borderColor = `${task.color}24`;
   // The label is the folder; which agent it is shows in the colour and, here, in words.
   pill.title = task.sessionId ? `${AGENT_LABEL[task.source]} · ${task.name}` : label;
+
+  // This pill's agent is waiting on a yes/no: answer right here, no card needed.
+  // The tooltip says what Allow would authorise.
+  const pending = State.queuedApprovals.find((q) => q.taskId === task.id);
+  if (pending) {
+    pill.classList.add("asking");
+    pill.title = `${label} asks: ${pending.command}`;
+    const act = (cls: string, title: string, icon: string, d: "allow" | "deny") =>
+      h("button", {
+        class: `pill-act ${cls}`,
+        title,
+        onclick: (e: Event) => {
+          e.stopPropagation();
+          actions.decide(d, pending.requestId);
+        },
+      }, svg(icon, 8, { stroke: d === "allow" ? 3 : 0 }));
+    pill.append(h("div", { class: "pill-acts" },
+      act("deny", "Deny", ICONS.xmark, "deny"),
+      act("allow", `Allow: ${pending.command}`, ICONS.check, "allow"),
+    ));
+  }
   pill.addEventListener("mouseenter", () => {
     pill.style.background = `${task.color}2e`;
     pill.style.borderColor = `${task.color}8c`;
@@ -261,7 +287,7 @@ function buildPill(task: AgentTask, actions: ViewActions): HTMLElement {
     (pill.querySelector(".lbl") as HTMLElement).style.color = "";
   });
 
-  if (task.pillBadge) {
+  if (task.pillBadge && !pending) {
     const colors = { approval: "#F5A524", finished: "#22C55E", error: "#F4505E" } as const;
     const icons = { approval: ICONS.bang, finished: ICONS.check, error: ICONS.xmark } as const;
     const inner = h("i", { style: `background:${colors[task.pillBadge]}` }, svg(icons[task.pillBadge], 6, { stroke: task.pillBadge === "finished" ? 3 : 0 }));

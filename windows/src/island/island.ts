@@ -20,6 +20,7 @@ import { USC, UploadSeq } from "../upload/sequence";
 import { buildHeader, buildViews, type ViewActions, type ViewHost } from "../views/views";
 import { h } from "../views/dom";
 import { IslandStateMachine } from "./fsm";
+import { forgetApproval, promoteNextApproval } from "./hooks";
 
 const BOT_OVERHANG = 40;
 /** Same margin as the Rust hit test (src-tauri/src/island.rs). */
@@ -161,18 +162,28 @@ export class Island {
       openUrl: (url) => {
         if (url) void Bridge.openUrl(url);
       },
-      decide: (d) => {
-        const req = State.pendingApproval;
-        void Bridge.log(`decide ${d} req=${req?.requestId ?? "none"}`);
+      // With a requestId the answer is for a request waiting on its pill; without
+      // one it is for the card.
+      decide: (d, requestId) => {
+        const queued = requestId ? State.queuedApprovals.find((q) => q.requestId === requestId) : undefined;
+        if (requestId && !queued) return; // it expired while the pill was showing
+        const req = queued ?? State.pendingApproval;
+        void Bridge.log(`decide ${d} req=${req?.requestId ?? "none"}${queued ? " (queued)" : ""}`);
         if (!req) return;
         Sound.play(d === "deny" ? "blip" : "approve");
+        forgetApproval(req.requestId);
         void Bridge.approvalDecision(req.requestId, d);
+        State.updateTask(req.taskId, "working");
+        State.setPillBadge(req.taskId, null);
+        if (queued) {
+          State.queuedApprovals = State.queuedApprovals.filter((q) => q !== queued);
+          State.notify();
+          return;
+        }
         State.pendingApproval = null;
         State.isPinned = false;
         this.fsm.pinned = false;
-        State.updateTask(req.taskId, "working");
-        State.setPillBadge(req.taskId, null);
-        this.setView(State.defaultView());
+        if (!promoteNextApproval(this)) this.setView(State.defaultView());
       },
       toggleSound: () => {
         State.settings.soundEnabled = !State.settings.soundEnabled;

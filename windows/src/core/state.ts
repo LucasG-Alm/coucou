@@ -206,6 +206,8 @@ class AppState {
   searchResult: SearchResult | null = null;
   chatHistory: ChatMessage[] = [];
   pendingApproval: ApprovalInfo | null = null;
+  /** Requests that came in while the card was busy; each is answered from its own pill. */
+  queuedApprovals: ApprovalInfo[] = [];
 
   integrations: Record<string, IntegrationInfo> = {};
 

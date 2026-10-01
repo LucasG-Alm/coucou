@@ -6,11 +6,47 @@
 
 import { Bridge, onEvent } from "../core/bridge";
 import { Sound } from "../core/sound";
-import { AGENT_TASK_IDS, defaultTaskName, State } from "../core/state";
+import { AGENT_TASK_IDS, defaultTaskName, State, type ApprovalInfo } from "../core/state";
 import type { Island } from "./island";
 
-/** Clears the approval card if no decision was made before the hook gave up. */
-let pendingTimeout: number | null = null;
+/** One timer per open request: the relay gives up after ~108 s, and then the card would be lying. */
+const approvalTimers = new Map<string, number>();
+
+export function forgetApproval(requestId: string) {
+  const t = approvalTimers.get(requestId);
+  if (t != null) window.clearTimeout(t);
+  approvalTimers.delete(requestId);
+}
+
+/** The card is free: the oldest request waiting on a pill takes it over. */
+export function promoteNextApproval(island: Island): boolean {
+  const next = State.queuedApprovals.shift();
+  if (!next) return false;
+  State.pendingApproval = next;
+  State.setPillBadge(next.taskId, null);
+  State.isPinned = true;
+  State.setFocus(next.taskId);
+  island.alert("approval");
+  return true;
+}
+
+function expireApproval(island: Island, requestId: string, taskId: string) {
+  approvalTimers.delete(requestId);
+  State.updateTask(taskId, "working");
+  State.setPillBadge(taskId, null);
+  const queued = State.queuedApprovals.findIndex((q) => q.requestId === requestId);
+  if (queued >= 0) {
+    State.queuedApprovals.splice(queued, 1);
+    State.notify();
+    return;
+  }
+  if (State.pendingApproval?.requestId !== requestId) return;
+  State.pendingApproval = null;
+  State.isPinned = false;
+  island.dropPin();
+  if (!promoteNextApproval(island) && State.view === "approval") island.setView(State.defaultView());
+  State.notify();
+}
 
 interface HookPayload {
   hook_event_name?: string;
@@ -312,24 +348,36 @@ function handleHook(island: Island, payload: HookPayload) {
         if (requestId) void Bridge.approvalDecline(requestId);
         break;
       }
-      // One card, one request. A second one must never quietly replace the first
-      // — that would leave a human staring at request B while request A waits for
-      // a decision nobody can give. Hand it straight back to the terminal.
-      if (State.pendingApproval && State.pendingApproval.requestId !== requestId) {
-        if (requestId) void Bridge.approvalDecline(requestId);
-        break;
-      }
-      upsert(id, projectName, cwd);
-      if (pendingTimeout != null) window.clearTimeout(pendingTimeout);
       const tool = payload.tool_name ?? "Tool";
       const input = payload.tool_input ?? {};
-      State.pendingApproval = {
+      const info: ApprovalInfo = {
         requestId,
         taskId: id,
         sessionId: payload.session_id ?? "",
         tool,
         command: approvalTarget(tool, input),
       };
+      // One card, one request. A second one must never quietly replace the first
+      // — that would leave a human staring at request B while request A waits for
+      // a decision nobody can give. It waits on its own pill instead (Allow / Deny
+      // there), up to a few; past that it goes straight back to the terminal.
+      if (State.pendingApproval && State.pendingApproval.requestId !== requestId) {
+        if (!requestId || State.queuedApprovals.length >= 5) {
+          if (requestId) void Bridge.approvalDecline(requestId);
+          break;
+        }
+        upsert(id, projectName, cwd);
+        State.queuedApprovals.push(info);
+        void Bridge.approvalAck(requestId);
+        State.updateTask(id, "approval");
+        State.setPillBadge(id, "approval");
+        Sound.play("approval");
+        approvalTimers.set(requestId, window.setTimeout(() => expireApproval(island, requestId, id), 110_000));
+        break;
+      }
+      upsert(id, projectName, cwd);
+      forgetApproval(requestId);
+      State.pendingApproval = info;
       // The relay's short ack window closes in 800 ms; everything below this
       // line is synchronous, so the card really is up by the time it lands.
       if (requestId) void Bridge.approvalAck(requestId);
@@ -344,17 +392,7 @@ function handleHook(island: Island, payload: HookPayload) {
       island.alert("approval");
       // Coucou answers within 108 s or not at all; after that the terminal has
       // taken over and the card would be lying.
-      pendingTimeout = window.setTimeout(() => {
-        pendingTimeout = null;
-        if (!State.pendingApproval) return;
-        State.pendingApproval = null;
-        State.isPinned = false;
-        island.dropPin();
-        State.updateTask(id, "working");
-        State.setPillBadge(id, null);
-        if (State.view === "approval") island.setView(State.defaultView());
-        State.notify();
-      }, 110_000);
+      approvalTimers.set(requestId, window.setTimeout(() => expireApproval(island, requestId, id), 110_000));
       break;
     }
 
