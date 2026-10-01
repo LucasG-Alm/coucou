@@ -6,7 +6,7 @@ import { Bridge, IS_TAURI, onDragDrop, type Placement } from "../core/bridge";
 import {
   EXPANDED_CORNER, EXPANDED_W, NOTCH_W, PANEL_H, PANEL_W,
   ROUNDED_CORNER, VIEW_LAYOUTS, botGlowColor, botGlowOpacity, botPosition, chatPromptHeight,
-  islandSize, isVertical, usesUprightLayout,
+  islandSize, isVertical, usesUprightLayout, COMPACT_COLUMN_MAX, COMPACT_COLUMN_TOP, COMPACT_MINI,
   type DockKind, type IslandMode, type IslandViewName,
 } from "../core/layout";
 import { Sound } from "../core/sound";
@@ -96,6 +96,7 @@ export class Island {
   private dragging = false;
   /** Rows of agent pills last laid out, to notice when the overview should resize. */
   private pillRows = 3;
+  private miniCount = -1;
 
   // Rust starts the window at full size so the launch greeting has room.
   private collapsed = false;
@@ -545,8 +546,8 @@ export class Island {
     // the state-driven DOM sync. The mini bots sit at the far end of the compact
     // pill: right when it lies down, bottom when it stands up.
     if (isVertical(this.dock)) {
-      this.miniGrid.style.left = `${w / 2 - 14.5}px`;
-      this.miniGrid.style.top = `${hh - 40 - 14.5}px`;
+      this.miniGrid.style.left = `${w / 2 - COMPACT_MINI / 2}px`;
+      this.miniGrid.style.top = `${COMPACT_COLUMN_TOP}px`;
     } else {
       this.miniGrid.style.left = `${w - 40 - 14.5}px`;
       this.miniGrid.style.top = `${hh / 2 - 14.5}px`;
@@ -962,6 +963,12 @@ export class Island {
       this.pillRows = rows;
       if (upright && State.view === "overview") this.animateGeometry(false);
     }
+    // Compact on a side edge: the column is as tall as its mini Mochis need.
+    const minis = Math.min(State.otherTasks.length, COMPACT_COLUMN_MAX);
+    if (minis !== this.miniCount) {
+      this.miniCount = minis;
+      if (State.mode === "compact" && isVertical(this.dock)) this.animateGeometry(false);
+    }
 
     this.contentEl.style.opacity = expanded && !greetingActive ? "1" : "0";
     this.contentEl.style.pointerEvents = expanded && !greetingActive ? "auto" : "none";
@@ -991,13 +998,15 @@ export class Island {
     const showGrid = State.mode === "compact";
     this.miniGrid.style.opacity = showGrid ? "1" : "0";
     if (showGrid) {
-      const others = State.otherTasks.slice(0, 4);
-      const key = others.map((t) => t.id).join("|");
+      const column = isVertical(this.dock);
+      const others = State.otherTasks.slice(0, column ? COMPACT_COLUMN_MAX : 4);
+      const key = (column ? "col:" : "grid:") + others.map((t) => t.id).join("|");
+      this.miniGrid.classList.toggle("col", column);
       if (this.miniGrid.dataset.key !== key) {
         this.miniGrid.dataset.key = key;
         this.miniGrid.replaceChildren();
         for (const t of others) {
-          this.miniGrid.append(createMiniBot(t, 13));
+          this.miniGrid.append(createMiniBot(t, column ? COMPACT_MINI : 13));
         }
         pruneMiniBots();
       }

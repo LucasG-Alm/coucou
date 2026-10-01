@@ -66,6 +66,21 @@ export const PANEL_H = 320;
 export const NOTCH_W = 184;
 export const NOTCH_H = 32;
 export const COMPACT_W = 288; // NOTCH_W + 104
+
+// Compact island standing on a side edge: Mochi on top and the other agents'
+// mini Mochis stacked in a single column under it, so its height follows how many
+// there are instead of the fixed 288 px of the lying-down pill.
+export const COMPACT_MINI = 16;
+export const COMPACT_MINI_GAP = 4;
+export const COMPACT_COLUMN_TOP = 36;
+export const COMPACT_COLUMN_MAX = 6;
+
+/** Height of the compact column for this many other agents (0 = just Mochi). */
+export function compactColumnHeight(pills: number): number {
+  const n = Math.min(COMPACT_COLUMN_MAX, Math.max(0, pills));
+  if (n === 0) return COMPACT_COLUMN_TOP;
+  return COMPACT_COLUMN_TOP + n * COMPACT_MINI + (n - 1) * COMPACT_MINI_GAP + 10;
+}
 export const EXPANDED_W = 640;
 
 export const ROUNDED_CORNER = 14; // hidden / compact
@@ -181,8 +196,8 @@ export function islandSize(
       // On a side edge it retracts to zero width instead.
       return upright ? { w: 0, h: NOTCH_W } : { w: NOTCH_W, h: 0 };
     case "compact":
-      // The same pill stood on its end: 32 wide, 288 tall.
-      return upright ? { w: NOTCH_H, h: COMPACT_W } : { w: COMPACT_W, h: NOTCH_H };
+      // Stood on its end it is 32 wide and only as tall as its agents need.
+      return upright ? { w: NOTCH_H, h: compactColumnHeight(pills) } : { w: COMPACT_W, h: NOTCH_H };
     case "expanded": {
       if (usesUprightLayout(dock, view)) {
         const h =
@@ -219,10 +234,10 @@ export function botPosition(
         ? { cx: NOTCH_H / 2, cy: 46, diameter: 6, opacity: 0 }
         : { cx: 46, cy: 16, diameter: 6, opacity: 0 };
     case "compact":
-      // Standing on its end the pill keeps Mochi at the same 40 px from the end,
-      // now the top one, and centred across the 32 px width.
+      // Standing on its end Mochi sits at the top, centred across the 32 px width,
+      // with the mini Mochis stacked right under it (see COMPACT_COLUMN_TOP).
       return upright
-        ? { cx: NOTCH_H / 2, cy: 40, diameter: 20, opacity: 1 }
+        ? { cx: NOTCH_H / 2, cy: 18, diameter: 20, opacity: 1 }
         : { cx: 40, cy: 16, diameter: 20, opacity: 1 };
     case "expanded": {
       const layout = VIEW_LAYOUTS[view];

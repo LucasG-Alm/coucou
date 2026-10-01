@@ -164,6 +164,15 @@ body {
   transition: opacity 0.25s ease-in-out;
 }
 
+/* Standing on a side edge the minis stack in one column under Mochi. */
+#mini-grid.col {
+  width: 16px;
+  height: auto;
+  grid-template-columns: 16px;
+  grid-auto-rows: 16px;
+  gap: 4px;
+}
+
 /* A mini Mochi: the slot is the body, the canvas is larger and overflows it so
    hands, badges and particles are not cut off. */
 .mini {
