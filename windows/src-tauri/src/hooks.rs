@@ -1,7 +1,8 @@
-// Claude Code and Codex hook installation.
+// Claude Code, Codex and Gemini CLI hook installation.
 //
 // The rule from CLAUDE.md is strict and is followed to the letter:
-// read %USERPROFILE%\.claude\settings.json (Codex: ~\.codex\hooks.json), take a
+// read %USERPROFILE%\.claude\settings.json (Codex: ~\.codex\hooks.json, Gemini:
+// ~\.gemini\settings.json), take a
 // dated backup, merge without touching anybody else's hooks, show the diff, and
 // write only after an explicit click. Uninstall removes Coucou's entries and
 // nothing else.
@@ -13,6 +14,10 @@
 // Codex: it runs hook commands through PowerShell, where a quoted path is a string
 // and not a call, hence the `&`. coucou-hook is a console program, so PowerShell
 // waits for it and its stdout reaches Codex — which is what carries a decision.
+//
+// Gemini: same PowerShell form (it runs hooks as `powershell -Command <command>`).
+// It has no permission hook at all, so there is nothing to answer; the island only
+// watches. Its timeouts are milliseconds, not seconds.
 
 use std::path::{Path, PathBuf};
 
@@ -56,6 +61,19 @@ const CODEX_EVENTS: &[(&str, u64, bool)] = &[
     ("Interrupt", 3, true),
 ];
 
+/// Gemini CLI events: (name, timeout in milliseconds). The relay translates the
+/// names to the ones the island knows. AfterModel is left out on purpose: it fires
+/// for every streamed chunk and would flood the island.
+/// See https://geminicli.com/docs/hooks/reference/
+const GEMINI_EVENTS: &[(&str, u64)] = &[
+    ("SessionStart", 10_000),
+    ("SessionEnd", 10_000),
+    ("BeforeAgent", 5_000),
+    ("BeforeTool", 5_000),
+    ("AfterTool", 5_000),
+    ("AfterAgent", 5_000),
+];
+
 /// Marker that identifies a Coucou entry inside a hook file.
 const MARKER: &str = "coucou-hook";
 
@@ -64,6 +82,7 @@ const MARKER: &str = "coucou-hook";
 pub enum Agent {
     Claude,
     Codex,
+    Gemini,
 }
 
 impl Agent {
@@ -72,6 +91,7 @@ impl Agent {
         match name.unwrap_or("claude") {
             "claude" => Ok(Agent::Claude),
             "codex" => Ok(Agent::Codex),
+            "gemini" => Ok(Agent::Gemini),
             other => Err(format!("unknown agent {other:?}")),
         }
     }
@@ -80,6 +100,7 @@ impl Agent {
         match self {
             Agent::Claude => "settings.json",
             Agent::Codex => "hooks.json",
+            Agent::Gemini => "settings.json",
         }
     }
 
@@ -87,6 +108,7 @@ impl Agent {
         match self {
             Agent::Claude => home().join(".claude").join("settings.json"),
             Agent::Codex => codex_home().join("hooks.json"),
+            Agent::Gemini => home().join(".gemini").join("settings.json"),
         }
     }
 
@@ -95,6 +117,7 @@ impl Agent {
         match self {
             Agent::Claude => HOOK_EVENTS.iter().map(|(e, t)| (*e, *t, false)).collect(),
             Agent::Codex => CODEX_EVENTS.to_vec(),
+            Agent::Gemini => GEMINI_EVENTS.iter().map(|(e, t)| (*e, *t, false)).collect(),
         }
     }
 
@@ -109,16 +132,25 @@ impl Agent {
                 "& '{}' {event} --agent codex",
                 exe.to_string_lossy().replace('\'', "''")
             ),
+            Agent::Gemini => format!(
+                "& '{}' {event} --agent gemini",
+                exe.to_string_lossy().replace('\'', "''")
+            ),
         }
     }
 
-    /// Codex without a ~/.codex folder is Codex not installed: say so instead of
-    /// quietly creating a folder it will never read.
+    /// Codex or Gemini without their folder is the agent not installed: say so
+    /// instead of quietly creating a folder it will never read.
     fn check_installed(self) -> Result<(), String> {
         let path = self.settings_path();
-        match (self, path.parent()) {
-            (Agent::Codex, Some(dir)) if !dir.exists() => Err(format!(
-                "{} doesn't exist — Codex doesn't look installed here.",
+        let name = match self {
+            Agent::Claude => return Ok(()),
+            Agent::Codex => "Codex",
+            Agent::Gemini => "Gemini CLI",
+        };
+        match path.parent() {
+            Some(dir) if !dir.exists() => Err(format!(
+                "{} doesn't exist — {name} doesn't look installed here.",
                 dir.display()
             )),
             _ => Ok(()),
@@ -634,6 +666,42 @@ mod tests {
     }
 
     #[test]
+    fn gemini_hooks_keep_its_settings_and_use_milliseconds_without_async() {
+        // A real Gemini settings.json is mostly other things; none of them may move.
+        let existing = serde_json::json!({
+            "security": { "auth": { "selectedType": "oauth-personal" } },
+            "ui": { "theme": "Default" },
+            "hooks": {
+                "BeforeTool": [{ "matcher": "run_shell_command", "hooks": [
+                    { "type": "command", "command": "their-guard.exe" }
+                ] }]
+            }
+        });
+        let after = merged(&existing, Agent::Gemini);
+        assert_eq!(after["security"], existing["security"]);
+        assert_eq!(after["ui"], existing["ui"]);
+
+        let before_tool = after["hooks"]["BeforeTool"].as_array().unwrap();
+        assert!(before_tool.iter().any(|e| serde_json::to_string(e).unwrap().contains("their-guard.exe")));
+        let ours = before_tool.iter().find(|e| entry_is_ours(e)).expect("no Coucou BeforeTool");
+        let handler = &ours["hooks"][0];
+        let command = handler["command"].as_str().unwrap();
+        // The event goes in under Gemini's own name; the relay translates it.
+        assert!(command.starts_with("& '"), "got: {command}");
+        assert!(command.ends_with("' BeforeTool --agent gemini"), "got: {command}");
+        // Gemini's timeouts are milliseconds, and it has no async flag.
+        assert_eq!(handler["timeout"], 5000);
+        assert!(handler.get("async").is_none());
+        // No permission hook exists there, and the streaming one is deliberately absent.
+        assert!(after["hooks"].get("PermissionRequest").is_none());
+        assert!(after["hooks"].get("AfterModel").is_none());
+        for event in ["SessionStart", "SessionEnd", "BeforeAgent", "AfterTool", "AfterAgent"] {
+            assert!(after["hooks"][event].as_array().unwrap().iter().any(entry_is_ours), "{event}");
+        }
+        assert_eq!(without_ours(&after), existing);
+    }
+
+    #[test]
     fn a_single_quote_in_the_path_is_doubled_for_powershell() {
         // Not the real exe path: this pins the escaping rule on its own.
         assert_eq!("C:\\Users\\O'Brien\\x.exe".replace('\'', "''"), "C:\\Users\\O''Brien\\x.exe");
@@ -644,7 +712,8 @@ mod tests {
         assert_eq!(Agent::parse(None), Ok(Agent::Claude));
         assert_eq!(Agent::parse(Some("claude")), Ok(Agent::Claude));
         assert_eq!(Agent::parse(Some("codex")), Ok(Agent::Codex));
-        assert!(Agent::parse(Some("gemini")).is_err());
+        assert_eq!(Agent::parse(Some("gemini")), Ok(Agent::Gemini));
+        assert!(Agent::parse(Some("gpt")).is_err());
     }
 
     #[test]

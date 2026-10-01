@@ -64,6 +64,8 @@ interface HookPayload {
   message?: string;
   /** Codex's Stop carries the last answer here instead of `message`. */
   last_assistant_message?: string | null;
+  /** Gemini's AfterAgent (our Stop) carries the answer here. */
+  prompt_response?: string | null;
   /** UserPromptSubmit carries `prompt`; `message` belongs to Notification/Stop. */
   prompt?: string;
   tool_name?: string;
@@ -120,6 +122,17 @@ const TOOL_LABELS: Record<string, string> = {
   PowerShell: "Exécute",
   // Codex reports `Bash` for shell and exec_command, and `apply_patch` for edits.
   apply_patch: "Modifie",
+  // Gemini CLI's built-in tools.
+  run_shell_command: "Exécute",
+  read_file: "Lit",
+  read_many_files: "Lit",
+  write_file: "Écrit",
+  replace: "Modifie",
+  glob: "Cherche",
+  grep_search: "Recherche",
+  list_directory: "Liste",
+  google_web_search: "Recherche web",
+  web_fetch: "Récupère",
 };
 
 function stepLabel(tool: string, input: Record<string, unknown>): string {
@@ -127,7 +140,7 @@ function stepLabel(tool: string, input: Record<string, unknown>): string {
   const str = (k: string) => (typeof input[k] === "string" ? (input[k] as string) : null);
   const cmd = str("command");
   if (cmd) return `${label} · ${cmd.slice(0, 40)}`;
-  const path = str("path");
+  const path = str("path") ?? str("absolute_path") ?? str("dir_path");
   if (path) return `${label} · ${lastPathComponent(path)}`;
   const file = str("file_path");
   if (file) return `${label} · ${lastPathComponent(file)}`;
@@ -292,7 +305,7 @@ function handleHook(island: Island, payload: HookPayload) {
     case "Stop":
       State.updateTask(id, "finished");
       {
-        const last = payload.message ?? payload.last_assistant_message;
+        const last = payload.message ?? payload.last_assistant_message ?? payload.prompt_response;
         if (last) State.appendStep(id, last.slice(0, 60));
       }
       Sound.play("finish");

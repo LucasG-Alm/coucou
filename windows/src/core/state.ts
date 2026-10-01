@@ -3,7 +3,7 @@
 import type { BotEmoteName, BotStateName, DockKind, IslandMode, IslandViewName } from "./layout";
 import type { EyeShape } from "../mochi/engine";
 
-export type AgentSource = "claudeCode" | "codex" | "n8n" | "agent";
+export type AgentSource = "claudeCode" | "codex" | "gemini" | "n8n" | "agent";
 export type PillBadge = "approval" | "finished" | "error";
 
 export interface AgentTask {
@@ -77,6 +77,7 @@ const task = (
 export const INTEGRATION_AGENTS: AgentTask[] = [
   task("integration_claude", "Claude Code", "#D97757", "claudeCode"),
   task("integration_codex", "Codex", "#93A0B4", "codex"),
+  task("integration_gemini", "Gemini", "#4C8DF6", "gemini"),
   task("integration_resend", "Resend", "#22C55E", "n8n"),
   task("integration_n8n", "n8n", "#F29B38", "n8n"),
   task("integration_vercel", "Vercel", "#7C5CFF", "n8n"),
@@ -90,14 +91,18 @@ export const INTEGRATION_AGENTS: AgentTask[] = [
 export const AGENT_TASK_IDS: Record<string, string> = {
   claude: "integration_claude",
   codex: "integration_codex",
+  gemini: "integration_gemini",
 };
 
-/** The AI agents are always on; only the polled integrations are opt-in. */
-const ALWAYS_ON_IDS = Object.values(AGENT_TASK_IDS);
+/** The AI agents with a pill of their own even when idle; only the polled integrations are opt-in. */
+const ALWAYS_ON_IDS = ["integration_claude", "integration_codex"];
+/** Gemini has no idle pill: it shows up while it has a session, and not a moment longer. */
+const SESSION_ONLY_IDS = ["integration_gemini"];
 
 export const AGENT_LABEL: Record<AgentSource, string> = {
   claudeCode: "Claude Code",
   codex: "Codex",
+  gemini: "Gemini",
   n8n: "n8n",
   agent: "Agent",
 };
@@ -285,6 +290,8 @@ class AppState {
         const mine = this.sessions.filter((s) => s.id.startsWith(`${proto.id}#`));
         if (mine.length) next.push(...mine);
         else next.push(existing.get(proto.id) ?? { ...proto, steps: [] });
+      } else if (SESSION_ONLY_IDS.includes(proto.id)) {
+        next.push(...this.sessions.filter((s) => s.id.startsWith(`${proto.id}#`)));
       } else if (this.settings.activeIntegrations.includes(proto.id)) {
         next.push(existing.get(proto.id) ?? { ...proto, steps: [] });
       }

@@ -56,6 +56,12 @@ const AGENT_UI: Record<HookAgent, { title: string; file: string; after: string }
     // Codex skips hooks it has not been told to trust; that step is yours.
     after: "Codex runs a hook only after you trust it: open /hooks in Codex once and trust the Coucou hooks.",
   },
+  gemini: {
+    title: "Gemini CLI",
+    file: "settings.json",
+    // Gemini has no permission hook, so it can be watched but not approved from here.
+    after: "Open a new Gemini CLI session to pick the hooks up. Gemini has no approval hook: the island shows what it is doing, but you answer its prompts in the terminal.",
+  },
 };
 
 function agentSection(agent: HookAgent, status: HookStatus): HTMLElement {
@@ -444,6 +450,7 @@ async function main() {
   const noHooks = { installed: false, settingsPath: "", hookPath: "", hookReady: false };
   const status = (await Bridge.hooksStatus("claude")) ?? { ...noHooks };
   const codexStatus = (await Bridge.hooksStatus("codex")) ?? { ...noHooks };
+  const geminiStatus = (await Bridge.hooksStatus("gemini")) ?? { ...noHooks };
 
   const hasKey = (await Bridge.secretPresent("anthropic-api-key")) ?? false;
 
@@ -459,6 +466,7 @@ async function main() {
     h("h1", {}, h("span", { text: "Coucou" }), h("span", { class: "version", text: version })),
     agentSection("claude", status),
     agentSection("codex", codexStatus),
+    agentSection("gemini", geminiStatus),
     apiSection(hasKey),
     integrationsSection(present),
     generalSection(),

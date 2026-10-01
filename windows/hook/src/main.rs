@@ -132,6 +132,23 @@ fn parse_args(args: impl Iterator<Item = String>) -> (String, String) {
     (event, if agent.is_empty() { "claude".into() } else { agent })
 }
 
+/// Gemini CLI names its events differently; the island only speaks Claude's.
+/// Gemini has no PermissionRequest, so nothing here ever waits for a human.
+/// See https://geminicli.com/docs/hooks/reference/
+fn canonical_event(agent: &str, event: &str) -> String {
+    if agent != "gemini" {
+        return event.to_string();
+    }
+    match event {
+        "BeforeTool" => "PreToolUse",
+        "AfterTool" => "PostToolUse",
+        "BeforeAgent" => "UserPromptSubmit",
+        "AfterAgent" => "Stop",
+        other => other,
+    }
+    .to_string()
+}
+
 /// The documented PermissionRequest output. Anything we do not recognise prints
 /// nothing at all rather than guessing — silence is the safe answer.
 /// See https://code.claude.com/docs/en/hooks
@@ -175,6 +192,7 @@ fn read_event() -> Option<(String, String, String)> {
         .map(str::to_string)
         .filter(|s| !s.is_empty())
         .unwrap_or(arg_event);
+    let event = canonical_event(&agent, &event);
     map.insert("hook_event_name".into(), serde_json::Value::String(event.clone()));
     map.insert("agent".into(), serde_json::Value::String(agent.clone()));
 
@@ -332,6 +350,19 @@ mod tests {
         assert_eq!(args(&["Stop", "--agent", "Co-dex!!"]).1, "co-dex");
         assert_eq!(args(&["Stop", "--agent", "my_tool"]).1, "mytool");
         assert_eq!(args(&["Stop", "--agent", &"x".repeat(40)]).1.len(), 24);
+    }
+
+    #[test]
+    fn gemini_events_become_the_ones_the_island_knows() {
+        assert_eq!(canonical_event("gemini", "BeforeTool"), "PreToolUse");
+        assert_eq!(canonical_event("gemini", "AfterTool"), "PostToolUse");
+        assert_eq!(canonical_event("gemini", "BeforeAgent"), "UserPromptSubmit");
+        assert_eq!(canonical_event("gemini", "AfterAgent"), "Stop");
+        // Already canonical, or lifecycle events both agents share: untouched.
+        assert_eq!(canonical_event("gemini", "SessionStart"), "SessionStart");
+        assert_eq!(canonical_event("gemini", "PreToolUse"), "PreToolUse");
+        // Only Gemini is translated: another agent's "BeforeTool" is not ours to guess.
+        assert_eq!(canonical_event("codex", "BeforeTool"), "BeforeTool");
     }
 
     #[test]

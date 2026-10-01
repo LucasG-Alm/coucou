@@ -146,8 +146,8 @@ export interface Placement {
   anchorY: number;
 }
 
-/** Whose hook file: Claude Code's settings.json or Codex's hooks.json. */
-export type HookAgent = "claude" | "codex";
+/** Whose hook file: Claude Code's settings.json, Codex's hooks.json or Gemini CLI's settings.json. */
+export type HookAgent = "claude" | "codex" | "gemini";
 
 export interface HookStatus {
   installed: boolean;
