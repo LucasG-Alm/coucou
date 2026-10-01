@@ -13,7 +13,9 @@
 //!   island is the whole point. No answer means empty stdout, and Claude Code
 //!   asks in the terminal exactly as if Coucou were not installed.
 //!
-//! Usage: `coucou-hook <EventName>` (the name is also read from the JSON).
+//! Usage: `coucou-hook <EventName> [--agent claude|codex]` (the event name is also
+//! read from the JSON; the agent defaults to `claude`). The agent travels in the
+//! payload as `agent`, so the island knows whose session an event belongs to.
 
 use std::io::{Read, Write};
 use std::sync::mpsc;
@@ -72,7 +74,7 @@ fn connect() -> Option<std::fs::File> {
 }
 
 fn main() {
-    let Some((payload, event)) = read_event() else { std::process::exit(0) };
+    let Some((payload, event, agent)) = read_event() else { std::process::exit(0) };
 
     let waits_for_answer = event == "PermissionRequest";
     let budget = if waits_for_answer { DECISION_BUDGET } else { FIRE_AND_FORGET_BUDGET };
@@ -86,15 +88,48 @@ fn main() {
         let _ = tx.send(talk(&payload, waits_for_answer));
     });
 
-    if let Ok(Some(decision)) = rx.recv_timeout(budget) {
-        if let Some(json) = decision_json(&decision) {
-            let mut out = std::io::stdout();
-            let _ = writeln!(out, "{json}");
-            let _ = out.flush();
-        }
+    let decided = match rx.recv_timeout(budget) {
+        Ok(Some(decision)) => decision_json(&decision),
+        _ => None,
+    };
+    if let Some(json) = decided.or_else(|| silent_reply(&agent, &event)) {
+        let mut out = std::io::stdout();
+        let _ = writeln!(out, "{json}");
+        let _ = out.flush();
     }
     // Nothing printed: Claude Code asks in the terminal, as if we were not here.
     std::process::exit(0);
+}
+
+/// What an event with nothing to decide still has to print. Codex rejects a
+/// `Stop` hook that exits 0 without JSON ("plain text output is invalid for this
+/// event"), so it gets an empty object. Everything else stays silent.
+/// See https://developers.openai.com/codex/hooks
+fn silent_reply(agent: &str, event: &str) -> Option<String> {
+    (agent == "codex" && event == "Stop").then(|| "{}".to_string())
+}
+
+/// `<Event> [--agent <name>]` from argv (program name already skipped).
+/// The event is the first argument that is not a flag; the agent is sanitised so
+/// a stray value can never become anything but a short lowercase word.
+fn parse_args(args: impl Iterator<Item = String>) -> (String, String) {
+    let mut event = String::new();
+    let mut agent = String::new();
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        if arg == "--agent" {
+            agent = args.next().unwrap_or_default();
+        } else if !arg.starts_with("--") && event.is_empty() {
+            event = arg;
+        }
+    }
+    let agent: String = agent
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .take(24)
+        .collect();
+    (event, if agent.is_empty() { "claude".into() } else { agent })
 }
 
 /// The documented PermissionRequest output. Anything we do not recognise prints
@@ -113,8 +148,8 @@ fn decision_json(decision: &str) -> Option<String> {
     ))
 }
 
-/// Reads stdin and returns the payload to forward plus the event name.
-fn read_event() -> Option<(String, String)> {
+/// Reads stdin and returns the payload to forward, the event name and the agent.
+fn read_event() -> Option<(String, String, String)> {
     let mut raw = Vec::new();
     if std::io::stdin().read_to_end(&mut raw).is_err() || raw.is_empty() {
         return None;
@@ -127,26 +162,13 @@ fn read_event() -> Option<(String, String)> {
     let mut payload = serde_json::from_slice::<serde_json::Value>(&raw).ok()?;
     let map = payload.as_object_mut()?;
 
-    // Parse argv: "coucou-hook.exe [--agent <name>] [<EventName>]"
-    // --agent tags the payload with coucou_agent so the app routes to the right pill.
-    // Absent or invalid names are validated and discarded by the app, not here.
-    let mut agent = String::new();
-    let mut arg_event = String::new();
-    {
-        let mut it = std::env::args().skip(1);
-        while let Some(arg) = it.next() {
-            if arg == "--agent" {
-                agent = it.next().unwrap_or_default();
-            } else if arg_event.is_empty() {
-                arg_event = arg;
-            }
-        }
-    }
-    // Which agent this hook was installed for. Absent means Claude Code,
-    // so existing hook commands keep working unchanged.
-    if !agent.is_empty() {
-        map.insert("coucou_agent".into(), serde_json::Value::String(agent));
-    }
+    // The event name is passed as argv[1] by the hook command; the JSON usually
+    // carries it too. Trust argv when the JSON is missing it.
+    let (arg_event, agent) = parse_args(std::env::args().skip(1));
+    // Also tag the payload the way upstream's third-party agent route expects,
+    // so a bare `--agent my-tool` keeps working; claude/codex are routed by
+    // the `agent` field below instead.
+    map.insert("coucou_agent".into(), serde_json::Value::String(agent.clone()));
     let event = map
         .get("hook_event_name")
         .and_then(|v| v.as_str())
@@ -154,6 +176,7 @@ fn read_event() -> Option<(String, String)> {
         .filter(|s| !s.is_empty())
         .unwrap_or(arg_event);
     map.insert("hook_event_name".into(), serde_json::Value::String(event.clone()));
+    map.insert("agent".into(), serde_json::Value::String(agent.clone()));
 
     for field in DROPPED_FIELDS {
         map.remove(*field);
@@ -192,7 +215,7 @@ fn read_event() -> Option<(String, String)> {
 
     let mut line = payload.to_string();
     line.push('\n');
-    Some((line, event))
+    Some((line, event, agent))
 }
 
 /// Caps every string in the payload. A single Write can carry a whole file.
@@ -270,6 +293,39 @@ mod tests {
         assert!(decision_json("maybe").is_none());
         // The shape the app used to send must not be mistaken for a decision.
         assert!(decision_json(r#"{"permissionDecision":"allow"}"#).is_none());
+    }
+
+    fn args(list: &[&str]) -> (String, String) {
+        parse_args(list.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn the_agent_defaults_to_claude_and_the_event_is_the_first_plain_argument() {
+        assert_eq!(args(&["Stop"]), ("Stop".into(), "claude".into()));
+        assert_eq!(args(&[]), ("".into(), "claude".into()));
+        assert_eq!(
+            args(&["PermissionRequest", "--agent", "codex"]),
+            ("PermissionRequest".into(), "codex".into())
+        );
+        // Flag first is just as good.
+        assert_eq!(args(&["--agent", "codex", "Stop"]), ("Stop".into(), "codex".into()));
+    }
+
+    #[test]
+    fn a_stray_agent_value_can_only_become_a_short_lowercase_word() {
+        assert_eq!(args(&["Stop", "--agent"]).1, "claude");
+        assert_eq!(args(&["Stop", "--agent", "Co-dex!!"]).1, "codex");
+        assert_eq!(args(&["Stop", "--agent", &"x".repeat(40)]).1.len(), 24);
+    }
+
+    #[test]
+    fn only_a_codex_stop_prints_without_a_decision() {
+        assert_eq!(silent_reply("codex", "Stop").as_deref(), Some("{}"));
+        assert!(silent_reply("claude", "Stop").is_none());
+        assert!(silent_reply("codex", "PreToolUse").is_none());
+        // A permission request nobody answered must stay silent for Codex too:
+        // empty output is what hands the question back to the terminal.
+        assert!(silent_reply("codex", "PermissionRequest").is_none());
     }
 
     #[test]
