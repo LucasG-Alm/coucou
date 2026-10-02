@@ -70,6 +70,7 @@ fn save_settings(app: AppHandle, shared: State<Shared>, mut settings: Settings) 
         settings.dock = current.dock.clone();
         settings.dock_x = current.dock_x;
         settings.dock_y = current.dock_y;
+        settings.dock_screen = current.dock_screen.clone();
         let screen_changed = current.screen != settings.screen;
         let autostart_changed = current.autostart != settings.autostart;
         *current = settings.clone();

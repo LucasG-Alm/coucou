@@ -44,6 +44,9 @@ const HIT_MARGIN: f64 = 14.0;
 
 /// How close to a screen edge a drop has to land to dock there, in logical px.
 pub const SNAP: f64 = 56.0;
+/// Dropped this close to the middle of the top edge, the island goes back to exactly
+/// centred instead of a few pixels off.
+pub const CENTER_SNAP: f64 = 24.0;
 
 /// Where on the screen the island lives. See `Settings::dock`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -124,9 +127,13 @@ pub fn window_geometry(mon: Rect, dock: Dock, dx: f64, dy: f64, collapsed: bool)
     match dock {
         Dock::Top => {
             let (w, h) = if collapsed { (STRIP_W, STRIP_H) } else { (PANEL_W, PANEL_H) };
+            // `dx` is where the island's centre sits along the edge; 0 — the default,
+            // and what an older settings.json holds — is the middle of the display.
+            let centre = if dx > 0.0 { dx } else { mon.w / 2.0 };
+            let x = clamp(mon.x + centre - w / 2.0, mon.x, mon.x + mon.w - w);
             Geometry {
-                win: Rect { x: mon.x + (mon.w - w) / 2.0, y: mon.y, w, h },
-                anchor_x: w / 2.0,
+                win: Rect { x, y: mon.y, w, h },
+                anchor_x: mon.x + centre - x,
                 anchor_y: 0.0,
             }
         }
@@ -171,7 +178,15 @@ pub fn classify_drop(mon: Rect, island: Rect) -> (Dock, f64, f64) {
         return (dock, 0.0, clamp(centre, 0.0, mon.h));
     }
     if to_top <= SNAP {
-        return (Dock::Top, 0.0, 0.0);
+        // The top edge keeps where along it the island was dropped; near the middle
+        // it snaps back to centred (0). Never 0 otherwise, since 0 means "centred".
+        let centre = island.x + island.w / 2.0 - mon.x;
+        let dx = if (centre - mon.w / 2.0).abs() <= CENTER_SNAP {
+            0.0
+        } else {
+            clamp(centre, 1.0, mon.w)
+        };
+        return (Dock::Top, dx, 0.0);
     }
     let centre = island.x + island.w / 2.0 - mon.x;
     (Dock::Free, clamp(centre, 0.0, mon.w), clamp(island.y - mon.y, 0.0, mon.h))
@@ -322,7 +337,16 @@ fn monitor_contains(m: &Monitor, x: f64, y: f64) -> bool {
         && y < (p.y + s.height as i32) as f64
 }
 
-/// The display the island lives on: the primary one, or the one under the cursor.
+/// A stable name for a display, to remember which one the island was dropped on.
+fn monitor_key(m: &Monitor) -> String {
+    m.name().cloned().unwrap_or_else(|| {
+        let p = m.position();
+        format!("{},{}", p.x, p.y)
+    })
+}
+
+/// The display the island lives on: the one under the cursor (if so asked), else the
+/// one it was last dropped on while that is still plugged in, else the primary.
 fn target_monitor(app: &AppHandle, pref: &str) -> Option<Monitor> {
     let monitors = app.available_monitors().ok()?;
     if pref == "cursor" {
@@ -330,6 +354,15 @@ fn target_monitor(app: &AppHandle, pref: &str) -> Option<Monitor> {
             if let Some(m) = monitors.iter().find(|m| monitor_contains(m, cx, cy)) {
                 return Some(m.clone());
             }
+        }
+    }
+    let remembered = app
+        .try_state::<crate::Shared>()
+        .map(|s| s.settings.lock().unwrap().dock_screen.clone())
+        .unwrap_or_default();
+    if !remembered.is_empty() {
+        if let Some(m) = monitors.iter().find(|m| monitor_key(m) == remembered) {
+            return Some(m.clone());
         }
     }
     app.primary_monitor()
@@ -452,25 +485,38 @@ fn drive_drag(app: &AppHandle, gate: &PollGate) {
 fn drop_island(app: &AppHandle, win: &WebviewWindow, gate: &PollGate) {
     let Some(shared) = app.try_state::<crate::Shared>() else { return };
     let pref = shared.settings.lock().unwrap().screen.clone();
-    let Some(m) = target_monitor(app, &pref) else { return };
+    // The display the button came up over is the one the island now lives on. (It used
+    // to be the stored one — the main display — so a drag onto a second screen was
+    // classified against the first and pulled straight back.)
+    let under_cursor = cursor_physical().and_then(|(cx, cy)| {
+        app.available_monitors()
+            .ok()?
+            .into_iter()
+            .find(|m| monitor_contains(m, cx, cy))
+    });
+    let Some(m) = under_cursor.or_else(|| target_monitor(app, &pref)) else { return };
     let Ok(origin) = win.outer_position() else { return };
-    let scale = win.scale_factor().unwrap_or(1.0);
-
+    // The window may still carry the scale of the display it started on, so the
+    // island is measured physically and only then turned into the target's logical px.
+    let win_scale = win.scale_factor().unwrap_or(1.0);
+    let mon_scale = m.scale_factor();
     let r = *gate.rect.lock().unwrap();
     let island = Rect {
-        x: origin.x as f64 / scale + r.x,
-        y: origin.y as f64 / scale + r.y,
-        w: r.w,
-        h: r.h,
+        x: (origin.x as f64 + r.x * win_scale) / mon_scale,
+        y: (origin.y as f64 + r.y * win_scale) / mon_scale,
+        w: r.w * win_scale / mon_scale,
+        h: r.h * win_scale / mon_scale,
     };
     let (dock, dx, dy) = classify_drop(monitor_rect(&m), island);
-    crate::log::line(format!("island dropped → {} ({dx:.0}, {dy:.0})", dock.as_str()));
+    let screen = monitor_key(&m);
+    crate::log::line(format!("island dropped → {} ({dx:.0}, {dy:.0}) on {screen}", dock.as_str()));
 
     let updated = {
         let mut s = shared.settings.lock().unwrap();
         s.dock = dock.as_str().to_string();
         s.dock_x = dx;
         s.dock_y = dy;
+        s.dock_screen = screen;
         let _ = crate::settings::save(&s);
         s.clone()
     };
@@ -748,9 +794,39 @@ mod tests {
     }
 
     #[test]
-    fn dropping_near_the_top_goes_back_to_the_notch() {
+    fn dropping_near_the_top_keeps_where_along_the_edge_it_was_dropped() {
+        // Island centre at x=844 (left of the middle, 960), 30 px from the top.
         let (dock, dx, dy) = classify_drop(MON, at(700.0, 30.0, 288.0, 32.0));
-        assert_eq!((dock, dx, dy), (Dock::Top, 0.0, 0.0));
+        assert_eq!((dock, dy), (Dock::Top, 0.0));
+        assert_eq!(dx, 844.0);
+
+        // Close to the middle it goes back to exactly centred.
+        let (_, dx, _) = classify_drop(MON, at(960.0 - 144.0 + 10.0, 10.0, 288.0, 32.0));
+        assert_eq!(dx, 0.0);
+
+        // Just outside the side snap, so still the top: never 0 by accident, 0 means "centred".
+        let (dock, dx, _) = classify_drop(MON, at(60.0, 10.0, 288.0, 32.0));
+        assert_eq!((dock, dx), (Dock::Top, 204.0));
+    }
+
+    #[test]
+    fn a_top_island_stays_where_it_was_dropped_with_its_window_inside_the_display() {
+        let g = window_geometry(MON, Dock::Top, 400.0, 0.0, false);
+        assert_eq!(g.win, at(40.0, 0.0, PANEL_W, PANEL_H));
+        assert_eq!((g.anchor_x, g.anchor_y), (360.0, 0.0));
+
+        // Near the left edge the window slides in and the island does not.
+        let edge = window_geometry(MON, Dock::Top, 150.0, 0.0, false);
+        assert_eq!(edge.win.x, 0.0);
+        assert_eq!(edge.win.x + edge.anchor_x, 150.0);
+
+        // Hidden, the wake strip sits under the same spot.
+        let strip = window_geometry(MON, Dock::Top, 400.0, 0.0, true);
+        assert_eq!(strip.win.x + strip.anchor_x, 400.0);
+
+        // On a second display it is measured from that display's corner.
+        let g2 = window_geometry(MON2, Dock::Top, 400.0, 0.0, false);
+        assert_eq!(g2.win.x, 1920.0 + 40.0);
     }
 
     #[test]

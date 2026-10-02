@@ -26,12 +26,17 @@ pub struct Settings {
     /// settings window, so `save_settings` keeps the stored value.
     #[serde(default = "default_dock")]
     pub dock: String,
-    /// left / right: where the strip's centre sits along the edge. free: where the
-    /// pill's top-centre sits. Logical px from the top-left of the chosen display.
+    /// top: where the island's centre sits along the top edge (0 = the middle of the
+    /// display). left / right: where the strip's centre sits along the edge. free:
+    /// where the pill's top-centre sits. Logical px from the top-left of the chosen display.
     #[serde(default)]
     pub dock_x: f64,
     #[serde(default)]
     pub dock_y: f64,
+    /// Name of the display the island was last dropped on ("" = the main one, or one
+    /// that is no longer plugged in). Written by the drag, like the rest of the dock.
+    #[serde(default)]
+    pub dock_screen: String,
 }
 
 fn default_model() -> String {
@@ -62,6 +67,7 @@ impl Default for Settings {
             dock: default_dock(),
             dock_x: 0.0,
             dock_y: 0.0,
+            dock_screen: String::new(),
         }
     }
 }

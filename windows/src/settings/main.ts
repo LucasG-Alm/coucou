@@ -411,7 +411,7 @@ function generalSection(): HTMLElement {
 
   const screen = h("select", {}) as HTMLSelectElement;
   screen.append(
-    h("option", { value: "primary", text: "Main display" }),
+    h("option", { value: "primary", text: "Where I last dropped it" }),
     h("option", { value: "cursor", text: "Display under the cursor" }),
   );
   screen.value = settings.screen;

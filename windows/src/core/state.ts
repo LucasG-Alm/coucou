@@ -164,6 +164,8 @@ export interface Settings {
   dock: DockKind;
   dockX: number;
   dockY: number;
+  /** Name of the display it was dropped on ("" = the main one). */
+  dockScreen: string;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -181,6 +183,7 @@ export const DEFAULT_SETTINGS: Settings = {
   dock: "top",
   dockX: 0,
   dockY: 0,
+  dockScreen: "",
 };
 
 type Listener = () => void;
