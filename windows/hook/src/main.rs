@@ -84,6 +84,10 @@ fn main() {
     };
 
     let waits_for_answer = event == "PermissionRequest";
+    let command = serde_json::from_str::<serde_json::Value>(&payload)
+        .ok()
+        .and_then(|v| v["tool_input"]["command"].as_str().map(str::to_string))
+        .unwrap_or_default();
     let budget = if waits_for_answer { DECISION_BUDGET } else { FIRE_AND_FORGET_BUDGET };
 
     // The worker owns every blocking call. If it overruns the budget we simply
@@ -96,7 +100,7 @@ fn main() {
     });
 
     let decided = match rx.recv_timeout(budget) {
-        Ok(Some(decision)) => reply_for(&agent, &decision),
+        Ok(Some(decision)) => reply_for(&agent, &decision, &command),
         _ => None,
     };
     if let Some(json) = decided.or_else(|| silent_reply(&agent, &event)) {
@@ -130,9 +134,9 @@ fn silent_reply(agent: &str, event: &str) -> Option<String> {
 const AGY_ASK: &str = r#"{"decision":"ask"}"#;
 
 /// What goes back to the agent for a click on the island.
-fn reply_for(agent: &str, decision: &str) -> Option<String> {
+fn reply_for(agent: &str, decision: &str, command: &str) -> Option<String> {
     if agent == "antigravity" {
-        agy_decision_json(decision)
+        agy_decision_json(decision, command)
     } else {
         decision_json(decision)
     }
@@ -142,8 +146,17 @@ fn reply_for(agent: &str, decision: &str) -> Option<String> {
 /// blocks it. Anything we do not recognise says nothing (the caller then falls
 /// back to `ask`), never a guess.
 /// See ~/.gemini/antigravity-cli/builtin/skills/agy-customizations/docs/hooks.md
-fn agy_decision_json(decision: &str) -> Option<String> {
+fn agy_decision_json(decision: &str, command: &str) -> Option<String> {
     match decision.trim() {
+        // A bare `allow` was not enough for agy to skip its own prompt; the same
+        // command also goes in as a one-off permission grant.
+        "allow" | "always" if !command.is_empty() => Some(
+            serde_json::json!({
+                "decision": "allow",
+                "permissionOverrides": [format!("command({command})")]
+            })
+            .to_string(),
+        ),
         "allow" | "always" => Some(r#"{"decision":"allow"}"#.to_string()),
         "deny" => Some(r#"{"decision":"deny","reason":"Denied from Coucou"}"#.to_string()),
         _ => None,
@@ -551,16 +564,20 @@ mod tests {
 
     #[test]
     fn agy_answers_are_the_documented_ones_and_silence_is_ask() {
-        assert_eq!(agy_decision_json("allow").unwrap(), r#"{"decision":"allow"}"#);
-        assert_eq!(agy_decision_json("always").unwrap(), r#"{"decision":"allow"}"#);
+        assert_eq!(agy_decision_json("allow", "").unwrap(), r#"{"decision":"allow"}"#);
+        assert_eq!(agy_decision_json("always", "").unwrap(), r#"{"decision":"allow"}"#);
         assert_eq!(
-            agy_decision_json("deny").unwrap(),
+            agy_decision_json("deny", "").unwrap(),
             r#"{"decision":"deny","reason":"Denied from Coucou"}"#
         );
-        assert!(agy_decision_json("maybe").is_none());
+        assert!(agy_decision_json("maybe", "").is_none());
         // The same click means a different JSON per agent.
-        assert!(reply_for("claude", "allow").unwrap().contains("hookSpecificOutput"));
-        assert_eq!(reply_for("antigravity", "allow").unwrap(), r#"{"decision":"allow"}"#);
+        assert!(reply_for("claude", "allow", "").unwrap().contains("hookSpecificOutput"));
+        assert_eq!(reply_for("antigravity", "allow", "").unwrap(), r#"{"decision":"allow"}"#);
+        assert_eq!(
+            reply_for("antigravity", "allow", "git status").unwrap(),
+            r#"{"decision":"allow","permissionOverrides":["command(git status)"]}"#
+        );
         // No answer must never become a block: agy gets `ask` on a tool check, `{}` elsewhere.
         assert_eq!(silent_reply("antigravity", "PreToolUse").unwrap(), AGY_ASK);
         assert_eq!(silent_reply("antigravity", "PermissionRequest").unwrap(), AGY_ASK);
